@@ -5,10 +5,7 @@
 
 # Authentication and security files
 keys/
-*.yaml
-*.yml
-config.yaml
-config.yml
+
 
 # SSL certificates and private keys
 ssl/
@@ -103,3 +100,5 @@ comparison_output/
 comparison_output_scan/
 comparison_output_session/
 PA/comparers/reports/
+PA/config/config_ecomm.yaml
+PA/config/config_vet.yaml
