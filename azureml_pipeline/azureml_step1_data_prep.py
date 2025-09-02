@@ -19,15 +19,31 @@ from azure.ai.ml.constants import AssetTypes, InputOutputModes
 from azureml.fsspec import AzureMachineLearningFileSystem
 from dotenv import load_dotenv
 
-# Add parent directory to path to import PA modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'PA'))
+import os
+import sys
 
-# Import PA processors
-from registration_processor import RegistrationProcessor
-from scan_processor import ScanProcessor
-from session_processor import SessionProcessor
-from utils.config_utils import load_config
-from utils.logging_utils import setup_logging
+# Fix import paths for Azure ML environment
+script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(script_dir)
+pa_dir = os.path.join(parent_dir, 'PA')
+
+# Add paths
+sys.path.insert(0, parent_dir)
+sys.path.insert(0, pa_dir)
+
+# Import with fallback
+try:
+    from registration_processor import RegistrationProcessor
+    from scan_processor import ScanProcessor
+    from session_processor import SessionProcessor
+    from utils.config_utils import load_config
+    from utils.logging_utils import setup_logging
+except ImportError:
+    from PA.registration_processor import RegistrationProcessor
+    from PA.scan_processor import ScanProcessor
+    from PA.session_processor import SessionProcessor
+    from PA.utils.config_utils import load_config
+    from PA.utils.logging_utils import setup_logging
 
 
 class DataPreparationStep:

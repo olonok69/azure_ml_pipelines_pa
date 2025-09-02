@@ -102,3 +102,8 @@ comparison_output_session/
 PA/comparers/reports/
 PA/config/config_ecomm.yaml
 PA/config/config_vet.yaml
+notebooks/.ipynb_aml_checkpoints/
+.amlignore
+.amlignore.amltmp
+notebooks/submit_pipeline.ipynb.amltmp
+*.amltmp
