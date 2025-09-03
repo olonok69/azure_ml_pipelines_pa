@@ -165,6 +165,72 @@ class DataPreparationStep:
         
         return config
     
+    def copy_outputs_to_azure_ml(self, output_paths: Dict[str, str]) -> None:
+        """
+        Copy processor outputs to Azure ML output directories for Step 2.
+        Following Azure ML SDK v2 pattern for data passing between pipeline steps.
+        
+        Args:
+            output_paths: Dictionary of Azure ML output paths from argparse
+        """
+        self.logger.info("Copying outputs to Azure ML directories for next steps")
+        
+        event_name = self.config.get('event', {}).get('name', 'ecomm')
+        
+        # Map local files to Azure ML outputs
+        # These mappings ensure Step 2 finds the files with expected names
+        file_mappings = {
+            'output_registration': [
+                # Registration outputs from data/{event}/output/
+                (f'data/{event_name}/output/df_reg_demo_this.csv', 'df_reg_demo_this.csv'),
+                (f'data/{event_name}/output/df_reg_demo_last_bva.csv', 'df_reg_demo_last_bva.csv'),
+                (f'data/{event_name}/output/df_reg_demo_last_lva.csv', 'df_reg_demo_last_lva.csv'),
+            ],
+            'output_scan': [
+                # Scan outputs - note the name mappings for ecomm
+                (f'data/{event_name}/output/sessions_visited_last_bva.csv', 'sessions_visited_last_bva.csv'),
+                (f'data/{event_name}/output/sessions_visited_last_lva.csv', 'sessions_visited_last_lva.csv'),
+                # Also try the alternate names
+                (f'data/{event_name}/output/sessions_with_demo_ecomm.csv', 'scan_last_filtered_valid_cols_ecomm.csv'),
+                (f'data/{event_name}/output/sessions_with_demo_tfm.csv', 'scan_last_filtered_valid_cols_tfm.csv'),
+                (f'data/{event_name}/output/scan_bva_past.csv', 'scan_bva_past.csv'),
+                (f'data/{event_name}/output/scan_lva_past.csv', 'scan_lva_past.csv'),
+            ],
+            'output_session': [
+                # Session outputs from data/{event}/output/
+                (f'data/{event_name}/output/session_this_filtered_valid_cols.csv', 'session_this_filtered_valid_cols.csv'),
+                (f'data/{event_name}/output/session_last_filtered_valid_cols_bva.csv', 'session_last_filtered_valid_cols_bva.csv'),
+                (f'data/{event_name}/output/session_last_filtered_valid_cols_lva.csv', 'session_last_filtered_valid_cols_lva.csv'),
+                (f'data/{event_name}/output/streams.json', 'streams.json'),
+                (f'data/{event_name}/output/streams.csv', 'streams.csv'),
+            ]
+        }
+        
+        # Copy files to appropriate Azure ML output directories
+        for output_key, files in file_mappings.items():
+            if output_key in output_paths and output_paths[output_key]:
+                output_path = output_paths[output_key]
+                os.makedirs(output_path, exist_ok=True)
+                self.logger.info(f"Copying {output_key} files to: {output_path}")
+                
+                for src_relative, dest_name in files:
+                    # Try the primary location
+                    src_path = os.path.join(root_dir, src_relative)
+                    
+                    if os.path.exists(src_path):
+                        dest_path = os.path.join(output_path, dest_name)
+                        shutil.copy2(src_path, dest_path)
+                        self.logger.info(f"  Copied {dest_name}")
+                    else:
+                        # Try alternate location (directly in data/output)
+                        alt_src = os.path.join(root_dir, 'data', 'output', dest_name)
+                        if os.path.exists(alt_src):
+                            dest_path = os.path.join(output_path, dest_name)
+                            shutil.copy2(alt_src, dest_path)
+                            self.logger.info(f"  Copied {dest_name} from alt location")
+                        else:
+                            self.logger.warning(f"  File not found: {src_relative}")
+
     def _create_temp_env_file(self, config: Dict[str, Any]) -> None:
         """
         Create a temporary .env file from Azure environment variables.
@@ -506,9 +572,10 @@ class DataPreparationStep:
                 
                 # Check for expected output files
                 expected_files = [
-                    'scan_this_filtered_valid_cols.csv',
-                    'scan_last_filtered_valid_cols_ecomm.csv',
-                    'scan_last_filtered_valid_cols_tfm.csv'
+                    'sessions_visited_last_bva.csv',
+                    'sessions_visited_last_lva.csv',
+                    'scan_lva_past',
+                    'scan_bva_past'
                 ]
                 
                 for filename in expected_files:
@@ -642,62 +709,186 @@ class DataPreparationStep:
             os.chdir(original_cwd)
             self.logger.info(f"Restored working directory to: {original_cwd}")
     
+
     def save_outputs(self, results: Dict[str, Any], output_paths: Dict[str, str]) -> None:
         """
         Save processing results to Azure ML output locations.
+        Ensures files are available for Step 2 by properly copying to mounted output paths.
         
         Args:
             results: Processing results from all processors
-            output_paths: Dictionary of output paths from argparse
+            output_paths: Dictionary of output paths from argparse (Azure ML mounted paths)
         """
         self.logger.info("Saving outputs to Azure ML paths")
+        self.logger.info(f"Output paths provided: {output_paths}")
         
-        # Map processor names to output types
-        output_mapping = {
-            'registration': 'output_registration',
-            'scan': 'output_scan',
-            'session': 'output_session'
+        event_name = self.config.get('event', {}).get('name', 'ecomm')
+        
+        # Map processor outputs to the files Step 2 expects
+        # The key is the output mount, the value is list of (source_file, dest_name) tuples
+        file_mappings = {
+            'output_registration': [
+                # These files are created by registration_processor in data/{event}/output/
+                (f'data/{event_name}/output/df_reg_demo_this.csv', 'df_reg_demo_this.csv'),
+                (f'data/{event_name}/output/df_reg_demo_last_bva.csv', 'df_reg_demo_last_bva.csv'),
+                (f'data/{event_name}/output/df_reg_demo_last_lva.csv', 'df_reg_demo_last_lva.csv'),
+
+            ],
+            'output_scan': [
+                # Scan processor creates these files
+                # For ecomm event:
+                (f'data/{event_name}/output/sessions_visited_last_bva.csv', 'sessions_visited_last_bva.csv'),
+                (f'data/{event_name}/output/sessions_visited_last_lva.csv', 'sessions_visited_last_lva.csv'),
+                (f'data/{event_name}/output/scan_lva_past.csv', 'scan_lva_past.csv'),
+                (f'data/{event_name}/output/scan_bva_past.csv', 'scan_bva_past.csv'),
+
+            ],
+            'output_session': [
+                # Session processor outputs
+                (f'data/{event_name}/output/session_this_filtered_valid_cols.csv', 'session_this_filtered_valid_cols.csv'),
+                (f'data/{event_name}/output/session_last_filtered_valid_cols_bva.csv', 'session_last_filtered_valid_cols_bva.csv'),
+                (f'data/{event_name}/output/session_last_filtered_valid_cols_lva.csv', 'session_last_filtered_valid_cols_lva.csv'),
+                (f'data/{event_name}/output/streams.json', 'streams.json'),
+                (f'data/{event_name}/output/streams.csv', 'streams.csv'),
+                # Cache file if exists
+                (f'data/{event_name}/output/streams_cache.json', 'streams_cache.json'),
+            ]
         }
         
-        for processor_name, output_key in output_mapping.items():
+        # Process each output type
+        total_files_copied = 0
+        for output_key, file_list in file_mappings.items():
             if output_key in output_paths and output_paths[output_key]:
                 output_path = output_paths[output_key]
                 
-                # Get processor results
-                processor_results = results.get(processor_name, {})
-                
-                if processor_results.get('status') == 'success':
-                    # Get output files from processor
-                    output_files = processor_results.get('output_files', [])
-                    
-                    # Create output directory
+                # CRITICAL: Ensure the output directory exists
+                # Azure ML mounts the path but we still need to create subdirectories if needed
+                try:
                     os.makedirs(output_path, exist_ok=True)
-                    
-                    # Copy output files to Azure ML output location
-                    for file_path in output_files:
-                        if os.path.exists(file_path):
-                            dest_path = os.path.join(output_path, os.path.basename(file_path))
-                            shutil.copy2(file_path, dest_path)
-                            self.logger.info(f"Copied {file_path} to {dest_path}")
+                    self.logger.info(f"\nProcessing {output_key}:")
+                    self.logger.info(f"  Output path: {output_path}")
+                except Exception as e:
+                    self.logger.error(f"  Failed to create output directory: {e}")
+                    continue
                 
+                files_copied_for_output = 0
+                
+                for source_file, dest_name in file_list:
+                    # Build full source path
+                    full_source = os.path.join(root_dir, source_file)
+                    
+                    # Try multiple possible locations
+                    possible_sources = [
+                        full_source,  # Primary expected location
+                        os.path.join(root_dir, 'data', 'output', dest_name),  # Fallback to data/output
+                        os.path.join(root_dir, 'data', 'output', os.path.basename(source_file)),  # Original filename in output
+                        os.path.join(root_dir, 'azureml_pipeline', source_file),  # In case of relative path issues
+                    ]
+                    
+                    file_copied = False
+                    for src in possible_sources:
+                        if os.path.exists(src) and os.path.isfile(src):
+                            dest_path = os.path.join(output_path, dest_name)
+                            try:
+                                shutil.copy2(src, dest_path)
+                                self.logger.info(f"  ✓ Copied: {dest_name} ({os.path.getsize(src)} bytes)")
+                                files_copied_for_output += 1
+                                file_copied = True
+                                break
+                            except Exception as e:
+                                self.logger.error(f"  ✗ Failed to copy {dest_name}: {e}")
+                    
+                    if not file_copied:
+                        # Log as warning but don't fail - some files might be optional
+                        self.logger.warning(f"  ⚠ Not found: {dest_name} (searched {len(possible_sources)} locations)")
+                
+                total_files_copied += files_copied_for_output
+                self.logger.info(f"  Summary: {files_copied_for_output} files copied to {output_key}")
+        
+        self.logger.info(f"\nTotal files copied to outputs: {total_files_copied}")
+        
         # Save metadata
         if 'output_metadata' in output_paths and output_paths['output_metadata']:
             metadata_path = output_paths['output_metadata']
-            os.makedirs(metadata_path, exist_ok=True)
-            
-            # Create metadata file
-            metadata = {
-                'timestamp': datetime.now().isoformat(),
-                'config': self.config_path,
-                'incremental': self.incremental,
-                'results': results
-            }
-            
-            metadata_file = os.path.join(metadata_path, 'metadata.json')
-            with open(metadata_file, 'w') as f:
-                json.dump(metadata, f, indent=2)
-            
-            self.logger.info(f"Saved metadata to {metadata_file}")
+            try:
+                os.makedirs(metadata_path, exist_ok=True)
+                
+                # Create comprehensive metadata
+                metadata = {
+                    'timestamp': datetime.now().isoformat(),
+                    'config_path': self.config_path,
+                    'event_name': event_name,
+                    'incremental': self.incremental,
+                    'processors_run': [],
+                    'results': results,
+                    'files_copied': total_files_copied,
+                    'output_locations': {
+                        'registration': output_paths.get('output_registration', ''),
+                        'scan': output_paths.get('output_scan', ''),
+                        'session': output_paths.get('output_session', ''),
+                    }
+                }
+                
+                # List successful processors
+                for processor_name, result in results.items():
+                    if result.get('status') == 'success':
+                        metadata['processors_run'].append(processor_name)
+                        # Add output file info if available
+                        if 'output_files' in result:
+                            metadata[f'{processor_name}_outputs'] = result['output_files']
+                
+                # Save metadata JSON
+                metadata_file = os.path.join(metadata_path, 'metadata.json')
+                with open(metadata_file, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                self.logger.info(f"Saved metadata to {metadata_file}")
+                
+                # Also create a summary text file
+                summary_file = os.path.join(metadata_path, 'step1_summary.txt')
+                with open(summary_file, 'w') as f:
+                    f.write("Data Preparation Step Summary\n")
+                    f.write("=" * 50 + "\n")
+                    f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+                    f.write(f"Configuration: {self.config_path}\n")
+                    f.write(f"Event Type: {event_name}\n")
+                    f.write(f"Incremental: {self.incremental}\n")
+                    f.write(f"Files Copied to Outputs: {total_files_copied}\n")
+                    f.write("\nProcessors Run:\n")
+                    for processor in metadata['processors_run']:
+                        f.write(f"  - {processor}\n")
+                    f.write("\nOutput Locations:\n")
+                    for key, path in metadata['output_locations'].items():
+                        if path:
+                            f.write(f"  - {key}: {path}\n")
+                            # List files in that output
+                            if os.path.exists(path):
+                                files = os.listdir(path)
+                                for file in files[:10]:  # List first 10 files
+                                    f.write(f"      • {file}\n")
+                
+                self.logger.info(f"Saved summary to {summary_file}")
+                
+            except Exception as e:
+                self.logger.error(f"Failed to save metadata: {e}")
+        
+        # CRITICAL: Verify outputs are accessible
+        self.logger.info("\n" + "="*50)
+        self.logger.info("VERIFYING OUTPUT ACCESSIBILITY")
+        self.logger.info("="*50)
+        
+        for output_key in ['output_registration', 'output_scan', 'output_session']:
+            if output_key in output_paths and output_paths[output_key]:
+                path = output_paths[output_key]
+                if os.path.exists(path) and os.path.isdir(path):
+                    files = os.listdir(path)
+                    self.logger.info(f"{output_key}: ✓ Accessible ({len(files)} files)")
+                    if files:
+                        self.logger.info(f"  Files: {', '.join(files[:5])}")  # Show first 5
+                else:
+                    self.logger.error(f"{output_key}: ✗ NOT ACCESSIBLE - Step 2 will fail!")
+        
+        self.logger.info("="*50)
     
     def process(self) -> Dict[str, Any]:
         """

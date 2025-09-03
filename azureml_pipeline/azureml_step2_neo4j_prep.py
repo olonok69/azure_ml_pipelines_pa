@@ -276,6 +276,10 @@ class Neo4jPreparationStep:
                 'scan_this_filtered_valid_cols.csv': 'scan_this_filtered_valid_cols.csv',
                 'scan_last_filtered_valid_cols_ecomm.csv': 'scan_bva_past.csv',
                 'scan_last_filtered_valid_cols_tfm.csv': 'scan_lva_past.csv',
+                'scan_bva_past.csv': 'scan_bva_past.csv',
+                'scan_lva_past.csv': 'scan_lva_past.csv',
+                'sessions_visited_last_bva.csv': 'sessions_visited_last_bva.csv',
+                'sessions_visited_last_lva.csv': 'sessions_visited_last_lva.csv',
                 
                 # Streams file from session processor
                 'streams.csv': 'streams.csv',
