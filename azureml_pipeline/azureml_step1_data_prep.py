@@ -37,36 +37,64 @@ sys.path.insert(0, parent_dir)
 sys.path.insert(0, pa_dir)
 
 # Import with fallback
-try:
-    from registration_processor import RegistrationProcessor
-    from scan_processor import ScanProcessor
-    from session_processor import SessionProcessor
-    from utils.config_utils import load_config
-    from utils.logging_utils import setup_logging
-except ImportError:
-    from PA.registration_processor import RegistrationProcessor
-    from PA.scan_processor import ScanProcessor
-    from PA.session_processor import SessionProcessor
-    from PA.utils.config_utils import load_config
-    from PA.utils.logging_utils import setup_logging
+
+from PA.registration_processor import RegistrationProcessor
+from PA.scan_processor import ScanProcessor
+from PA.session_processor import SessionProcessor
+from PA.utils.config_utils import load_config
+from PA.utils.logging_utils import setup_logging
+from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
 
 
 
 class DataPreparationStep:
     """Azure ML Data Preparation Step for Personal Agendas pipeline."""
     
-    def __init__(self, config_path: str, incremental: bool = False):
+    def __init__(self, config_path: str, incremental: bool = False, use_keyvault: bool = True):
         """
         Initialize the Data Preparation Step.
         
         Args:
             config_path: Path to configuration file
             incremental: Whether to run incremental processing
+            use_keyvault: Whether to use Azure Key Vault for secrets
         """
         self.config_path = config_path
         self.incremental = incremental
+        self.use_keyvault = use_keyvault
         self.logger = self._setup_logging()
+        
+        # Load secrets from Key Vault if in Azure ML
+        if self.use_keyvault and self._is_azure_ml_environment():
+            self._load_secrets_from_keyvault()
+        
         self.config = self._load_configuration(config_path)
+    
+    def _is_azure_ml_environment(self) -> bool:
+        """Check if running in Azure ML environment."""
+        # Azure ML sets specific environment variables
+        return any([
+            os.environ.get("AZUREML_RUN_ID"),
+            os.environ.get("AZUREML_EXPERIMENT_NAME"),
+            os.environ.get("AZUREML_WORKSPACE_NAME")
+        ])
+    
+    def _load_secrets_from_keyvault(self) -> None:
+        """Load secrets from Azure Key Vault."""
+        try:
+            keyvault_name = os.environ.get("KEYVAULT_NAME", "strategicai-kv-uks-dev")
+            self.logger.info(f"Loading secrets from Key Vault: {keyvault_name}")
+            
+            # Ensure .env file exists from Key Vault
+            env_path = os.path.join(project_root, "PA", "keys", ".env")
+            if ensure_env_file(keyvault_name, env_path):
+                self.logger.info("Successfully loaded secrets from Key Vault")
+            else:
+                self.logger.warning("Could not load secrets from Key Vault, will try environment variables")
+                
+        except Exception as e:
+            self.logger.error(f"Error loading secrets from Key Vault: {e}")
+            self.logger.info("Falling back to environment variables or existing .env file")
         
     def _setup_logging(self) -> logging.Logger:
         """Setup logging configuration."""
@@ -102,6 +130,27 @@ class DataPreparationStep:
         # Load base configuration
         config = load_config(config_path)
         
+        # CRITICAL FIX: Ensure env_file path is absolute
+        # This fixes the SessionProcessor .env loading issue
+        if 'env_file' in config:
+            # If env_file is a relative path, make it absolute relative to project root
+            env_file_path = config['env_file']
+            if not os.path.isabs(env_file_path):
+                # The env file is expected to be at PA/keys/.env
+                abs_env_path = os.path.join(project_root, 'PA', env_file_path)
+                # Also try without PA prefix if it's already included
+                if not os.path.exists(abs_env_path):
+                    abs_env_path = os.path.join(project_root, env_file_path)
+                
+                if os.path.exists(abs_env_path):
+                    config['env_file'] = abs_env_path
+                    self.logger.info(f"Updated env_file path to absolute: {abs_env_path}")
+                else:
+                    # If .env file doesn't exist, create it or use environment variables
+                    self.logger.warning(f"Environment file not found at {abs_env_path}")
+                    # Try to create a temporary env file from Azure environment variables
+                    self._create_temp_env_file(config)
+        
         # Add Azure ML specific settings if not present
         if 'azure_ml' not in config:
             config['azure_ml'] = {
@@ -116,6 +165,43 @@ class DataPreparationStep:
         
         return config
     
+    def _create_temp_env_file(self, config: Dict[str, Any]) -> None:
+        """
+        Create a temporary .env file from Azure environment variables.
+        This is used when the .env file is not found in the expected location.
+        
+        Args:
+            config: Configuration dictionary
+        """
+        # Create PA/keys directory structure if it doesn't exist
+        keys_dir = os.path.join(project_root, 'PA', 'keys')
+        os.makedirs(keys_dir, exist_ok=True)
+        
+        # Create the .env file in the expected location
+        temp_env_path = os.path.join(keys_dir, '.env')
+        
+        # Check for environment variables that might be set in Azure ML
+        env_vars = {
+            'OPENAI_API_KEY': os.environ.get('OPENAI_API_KEY', ''),
+            'AZURE_API_KEY': os.environ.get('AZURE_API_KEY', ''),
+            'AZURE_ENDPOINT': os.environ.get('AZURE_ENDPOINT', ''),
+            'AZURE_DEPLOYMENT': os.environ.get('AZURE_DEPLOYMENT', ''),
+            'AZURE_API_VERSION': os.environ.get('AZURE_API_VERSION', ''),
+            'NEO4J_URI': os.environ.get('NEO4J_URI', ''),
+            'NEO4J_USERNAME': os.environ.get('NEO4J_USERNAME', ''),
+            'NEO4J_PASSWORD': os.environ.get('NEO4J_PASSWORD', '')
+        }
+        
+        # Write environment variables to temp file
+        with open(temp_env_path, 'w') as f:
+            for key, value in env_vars.items():
+                if value:  # Only write non-empty values
+                    f.write(f"{key}={value}\n")
+        
+        # Update config to use the absolute path
+        config['env_file'] = temp_env_path
+        self.logger.info(f"Created temporary environment file at {temp_env_path}")
+
     def download_blob_data(self, uri_or_path: str, local_dir: str) -> List[str]:
         """
         Download data from Azure Blob Storage or copy from mounted path.
@@ -469,6 +555,34 @@ class DataPreparationStep:
         self.logger.info(f"Changed working directory to: {root_dir}")
         
         try:
+            # CRITICAL: Ensure the config has the correct absolute path for env_file
+            # This was already done in _load_configuration, but let's verify
+            if 'env_file' in self.config:
+                env_file_path = self.config['env_file']
+                if not os.path.exists(env_file_path):
+                    self.logger.warning(f"Env file not found at {env_file_path}, checking alternatives...")
+                    
+                    # Try different possible locations
+                    possible_paths = [
+                        os.path.join(original_cwd, 'PA', 'keys', '.env'),
+                        os.path.join(root_dir, 'PA', 'keys', '.env'),
+                        os.path.join(project_root, 'PA', 'keys', '.env'),
+                        os.path.join(os.getcwd(), 'PA', 'keys', '.env'),
+                        os.path.join(os.getcwd(), 'keys', '.env'),
+                        'PA/keys/.env',
+                        'keys/.env'
+                    ]
+                    
+                    for path in possible_paths:
+                        if os.path.exists(path):
+                            self.config['env_file'] = os.path.abspath(path)
+                            self.logger.info(f"Found env file at: {path}")
+                            break
+                    else:
+                        # If no .env file found, create one from environment variables
+                        self._create_temp_env_file(self.config)
+            
+            # Initialize the processor with the updated config
             processor = SessionProcessor(self.config)
             
             # Check if we should skip this processor
@@ -480,19 +594,33 @@ class DataPreparationStep:
                 output_dir = self.config.get('output_dir', 'output')
                 output_files = []
                 
-                # Check for expected output files
-                expected_files = [
-                    'session_this_filtered_valid_cols.csv',
-                    'session_last_filtered_valid_cols_ecomm.csv',
-                    'session_last_filtered_valid_cols_tfm.csv',
-                    'streams.json'
-                ]
+                # Check for expected output files based on event type
+                event_name = self.config.get('event', {}).get('name', 'ecomm')
                 
+                if event_name == 'ecomm':
+                    expected_files = [
+                        'session_this_filtered_valid_cols.csv',
+                        'session_last_filtered_valid_cols_bva.csv',  # Using bva suffix for ecomm
+                        'session_last_filtered_valid_cols_lva.csv',  # Using lva suffix for tfm
+                        'streams.json'
+                    ]
+                else:  # vet/bva
+                    expected_files = [
+                        'session_this_filtered_valid_cols.csv',
+                        'session_last_filtered_valid_cols_bva.csv',
+                        'session_last_filtered_valid_cols_lva.csv',
+                        'streams.json'
+                    ]
+                
+                # Look for output files
+                output_path = os.path.join(output_dir, 'output')
                 for filename in expected_files:
-                    filepath = os.path.join(output_dir, filename)
+                    filepath = os.path.join(output_path, filename)
                     if os.path.exists(filepath):
                         output_files.append(filepath)
                         self.logger.info(f"Found output file: {filepath}")
+                    else:
+                        self.logger.warning(f"Expected output file not found: {filepath}")
                 
                 result = {
                     'status': 'success',
@@ -627,7 +755,7 @@ def main(args):
     print("="*60)
     
     # Enable auto logging
-    mlflow.autolog()
+    # mlflow.autolog()
     
     # Load environment variables
     load_dotenv()
