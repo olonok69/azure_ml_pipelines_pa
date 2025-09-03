@@ -1,0 +1,316 @@
+# Event-specific configuration for ECOMM events
+# This configuration file contains all event-specific settings and output file names
+
+# Event configuration - CHANGED FOR ECOMM
+event:
+  name: "ecomm"
+  main_event: "ecomm"
+  main_event_name: "ecomm"  # CHANGED: "bva" -> "ecomm" (will NOT trigger vet-specific functions)
+  secondary_event_name: "tfm"  # CHANGED: "lva" -> "tfm"
+  year: 2025
+  shows_this_year:
+    - ['ECE25','TFM25'] # CHANGED: "BVA2025" -> "ECE25"
+  shows_this_year_exclude:
+    - ["TFM24"] # CHANGED: "BVA2025" -> "ECE25"
+  shows_last_year_main:
+    - "ECE24"  # CHANGED: "BVA2024" -> "ECE24"
+  shows_last_year_secondary:
+    - "TFM24"  # CHANGED: "LVS2024" -> "TFM24"
+
+# Badge history column names (SAME AS VET)
+badge_history_columns:
+  main_event: "BadgeId_last_year_bva"
+  secondary_event: "BadgeId_last_year_lva"
+
+# Practice type column names for different years - CHANGED FOR ECOMM
+practice_type_columns:
+  current: "what_best_describes_what_you_do"  # CHANGED: ECOMM question
+  past: "what_best_describes_your_specialism"  # CHANGED: ECOMM question
+
+# Practice matching configuration (GENERIC - SAME STRUCTURE)
+practice_matching:
+  company_column: "Company Name"
+  practice_type_column: "Main Type of Veterinary Practice"  # Could be "Main Type of Business" for ECOMM
+  match_threshold: 95
+
+# Job role processing configuration - REMOVED (will use generic logic)
+job_role_question: "What is your job role"  # SAME
+
+# Output file configurations (SAME AS VET - keeps compatibility)
+output_files:
+  professions_list: "list_of_professions.csv"
+  specializations: "specializations.json"
+  job_roles: "job_roles.json"
+  raw_data:
+    main_event_registration: "Registration_data_bva.csv"
+    secondary_event_registration: "Registration_data_lva.csv"
+    main_event_demographic: "Registration_demographicdata_bva.csv"
+    secondary_event_demographic: "Registration_demographicdata_lva.csv"
+  processed_data:
+    this_year: "Registration_data_bva_25_only_valid.csv"
+    last_year_main: "Registration_data_bva_24_only_valid.csv"
+    returning_main: "Registration_data_bva_24_25_only_valid.csv"
+    returning_secondary: "Registration_data_lva_24_25_only_valid.csv"
+  demographic_data:
+    this_year: "Registration_demographicdata_bva_25_raw.csv"
+    last_year_main: "Registration_demographicdata_bva_24_raw.csv"
+    last_year_secondary: "Registration_demographicdata_lva_24_raw.csv"
+  returning_demographic_data:
+    main_event: "Registration_demographicdata_bva_24_25.csv"
+    secondary_event: "Registration_demographicdata_lva_24_25.csv"
+  registration_with_demographic:
+    this_year: "Registration_data_with_demographicdata_bva_this.csv"
+    last_year_main: "Registration_data_with_demographicdata_bva_last.csv"
+    last_year_secondary: "Registration_data_with_demographicdata_lva_last.csv"
+  concatenated_registration_data:
+    this_year: "bva_registration_data_this_year.json"
+    past_year_main: "bva_registration_data_past_year.json"
+    past_year_secondary: "lva_registration_data_past_year.json"
+  processed_demographic_data:
+    this_year: "demographic_data_this.json"
+    last_year_main: "demographic_data_last_bva.json"
+    last_year_secondary: "demographic_data_last_lva.json"
+  combined_demographic_registration:
+    this_year: "df_reg_demo_this.csv"
+    last_year_main: "df_reg_demo_last_bva.csv"
+    last_year_secondary: "df_reg_demo_last_lva.csv"
+  recommendations:
+    output_directory: "recommendations"  # Subdirectory for recommendations
+    filename_pattern: "visitor_recommendations_{timestamp}"  # Pattern for output files
+    save_csv: true
+# Pipeline control settings (SAME AS VET)
+create_only_new: false  # If true, only process new visitors without recommendations
+
+# Pipeline step activation settings - UPDATED FOR NEO4J SESSION PROCESSING
+pipeline_steps:
+  # Data processing steps
+  registration_processing: true
+  scan_processing: true  
+  session_processing: true
+  # Neo4j processing steps
+  neo4j_visitor_processing: true
+  neo4j_session_processing: true  # ENABLED: Added Neo4j session processing
+  neo4j_job_stream_processing: true  # ENABLED but will be skipped via config
+  neo4j_specialization_stream_processing: true  # ENABLED but will be skipped via config
+  neo4j_visitor_relationship_processing: true
+  session_embedding_processing: true
+  session_recommendation_processing: true  # Enable session recommendation processing
+
+# Input file paths - CHANGED FOR ECOMM
+input_files:
+  main_event_registration: "data/ecomm/20250818_registration_ECE_TFM_24_25.json"  # CHANGED
+  secondary_event_registration: "data/ecomm/20250722_registration_TFM24.json"  # CHANGED
+  main_event_demographic: "data/ecomm/20250818_demographics_ECE_TFM_24_25.json"  # CHANGED
+  secondary_event_demographic: "data/ecomm/20250722_demographics_TFM24.json"  # CHANGED
+  # practices: "data/ecomm/practices_missing.csv"  # CHANGED
+
+# Scan data configuration - CHANGED FOR ECOMM
+scan_files:
+  session_this: "data/ecomm/ECE_TFM_25_session_export.csv"
+  session_past_main: "data/ecomm/ECE24_session_export.csv"
+  session_past_secondary: "data/ecomm/TFM24_session_export.csv"
+  seminars_scan_reference_past_main: "data/ecomm/ece2024 seminar scans reference.csv"
+  seminars_scans_past_main: "data/ecomm/ece2024 seminar scans.csv"
+  seminars_scan_reference_past_secondary: "data/ecomm/tfm2024 seminar scans reference.csv"
+  seminars_scans_past_secondary: "data/ecomm/tfm2024 seminar scans.csv"
+
+# Session data file paths (REQUIRED FOR SESSION PROCESSOR) - CHANGED FOR ECOMM
+session_files:
+  session_this: "data/ecomm/ECE25_session_export.csv"
+  session_past_bva: "data/ecomm/ECE24_session_export.csv"
+  session_past_lva: "data/ecomm/TFM24_session_export.csv"
+
+# Stream processing configuration
+stream_processing:
+  use_cached_descriptions: false
+
+# Scan output files
+scan_output_files:
+  processed_scans:
+    last_year_main: "scan_bva_past.csv"   # Changed from bva to ecomm
+    last_year_secondary: "scan_lva_past.csv"  # Changed from lva to tfm
+
+# Session output file configuration
+session_output_files:
+  processed_sessions:
+    this_year: "session_this_filtered_valid_cols.csv"
+    last_year_main: "session_last_filtered_valid_cols_bva.csv"   # Changed from bva to ecomm
+    last_year_secondary: "session_last_filtered_valid_cols_lva.csv"  # Changed from lva to tfm
+  streams_catalog: "streams.json"
+  
+# Session processing configuration (SAME STRUCTURE)
+# ECOMM-specific titles to remove during session filtering
+titles_to_remove:
+  - "exhibitor showcase"
+  - "tbc session"
+  - "-"
+  - "session tba"
+  - "Session title to be confirmed"
+  - "session title to be confirm"
+  - "session details to follow"
+  - "session tbc"
+
+# ECOMM-specific sponsor mapping (equivalent to map_vets for BVA)
+# ECOMM-specific sponsor abbreviation mappings (renamed from map_sponsors to map_vets for compatibility)
+map_vets:
+  "DEPT": "Dept Agency"
+  "GFS": "GFS Real Estate Marketing UK Limited"
+  "IMRG": "IMRG LIMITED"
+
+# Embedding configuration (SAME AS VET)
+embeddings:
+  model: "all-MiniLM-L6-v2"     # Model to use for generating session embeddings
+  batch_size: 100               # Batch size for processing embeddings
+  include_stream_descriptions: false  # Whether to include stream descriptions in embeddings
+
+# Session recommendation configuration
+
+recommendation:
+  min_similarity_score: 0.3       # Minimum similarity score (0.0-1.0) for recommendations
+  max_recommendations: 20         # Maximum number of recommendations per visitor
+  similar_visitors_count: 3       # Number of similar visitors to consider for new visitors
+  use_langchain: false            # Whether to use LangChain for filtering
+  enable_filtering: false         # Disable filtering for ECOMM shows
+  
+  # Similarity attributes for finding similar visitors (ecomm-specific)
+  similarity_attributes:
+    what_is_your_job_role: 1.0
+    what_best_describes_what_you_do: 1.0
+    what_is_your_industry: 0.8
+    what_is_the_main_solution_you_are_most_excited_to_discover_at_the_show: 0.6
+    Country: 0.3
+    why_are_you_attending: 0.6
+  
+
+  role_groups: {}
+  
+
+  field_mappings:
+    practice_type_field: "what_best_describes_what_you_do"
+    job_role_field: "what_is_your_job_role"
+
+  # No filtering rules for ECOMM (can be added later if needed)
+  rules_config: {}
+
+# Neo4j configuration (SAME STRUCTURE - different database)
+neo4j:
+  uri: "neo4j+s://928872b4.databases.neo4j.io"
+  username: "neo4j"
+  password: ""
+  show_name: "ecomm"  # ADDED: Show attribute for ECOMM nodes
+  node_labels:
+    visitor_this_year: "Visitor_this_year"
+    visitor_last_year_bva: "Visitor_last_year_bva"
+    visitor_last_year_lva: "Visitor_last_year_lva"
+    session_this_year: "Sessions_this_year"
+    session_past_year: "Sessions_past_year"
+    stream: "Stream"
+  unique_identifiers:
+    visitor: "BadgeId"  # Field to use as unique identifier for visitor nodes
+    session: "session_id"  # Field to use as unique identifier for session nodes
+    stream: "stream"  # Field to use as unique identifier for stream nodes
+  relationships:
+    session_stream: "HAS_STREAM"  # Relationship between sessions and streams
+    job_stream: "job_to_stream"  # Relationship between job roles and streams
+    specialization_stream: "specialization_to_stream"  # Relationship between specializations and streams
+    same_visitor: "Same_Visitor"  # Relationship between visitors this year and last year
+    attended_session: "attended_session"  # Relationship between visitors and sessions they attended
+  
+  # NEW: Job stream mapping configuration with skip support
+  job_stream_mapping:
+    enabled: false  # NEW: Disable job stream processing for ECOMM shows
+    file: "job_to_stream.csv"  # File containing job to stream mappings (for future use)
+    job_role_field: "what_is_your_job_role"  # Field containing job role information
+    
+  # NEW: Specialization stream mapping configuration with skip support  
+  specialization_stream_mapping:
+    enabled: false  # NEW: Disable specialization stream processing for ECOMM shows
+    file: "spezialization_to_stream.csv"  # File containing specialization to stream mapping (for future use)
+    specialization_field_this_year: "what_best_describes_what_you_do"  # ECOMM field for current year
+    specialization_field_bva: "what_best_describes_your_specialism"    # ECOMM field for main past year
+    specialization_field_lva: "what_best_describes_your_specialism"    # ECOMM field for secondary past year
+    specialization_map: {
+      # ECOMM-specific specialization mapping (different from vet) - for future use
+      "B2B": "Business",
+      "B2C": "Consumer", 
+      "Marketplace": "Platform",
+      "SaaS": "Technology",
+      "Fashion": "Retail",
+      "Electronics": "Retail"
+    }
+  
+  visitor_relationship:
+    same_visitor_properties:
+      bva: { type: "ecomm" }  # CHANGED: Properties for ECOMM Same_Visitor relationships (maps to ECE)
+      lva: { type: "tfm" }    # CHANGED: Properties for TFM Same_Visitor relationships
+
+# Default properties for visitor nodes (SAME STRUCTURE)
+default_visitor_properties:
+  Days_since_registration: "119"
+  Country: "UK"
+  Source: "ECOMM Key Stakeholders"  # CHANGED
+  Email_domain: "company.com"  # CHANGED
+  assist_year_before: "1"
+  what_is_your_job_role: "NA"
+  what_best_describes_what_you_do: "NA"  # Keep same for compatibility
+  what_is_your_industry: "NA"
+  what_is_the_main_solution_you_are_most_excited_to_discover_at_the_show: "NA"
+  why_are_you_attending: "NA"
+  JobTitle: "NA"
+  show: "ecomm"
+
+
+# Environment file path
+env_file: "keys/.env"
+
+# Language model configuration
+language_model:
+  model: "gpt-4.1-mini"
+  temperature: 0.5
+  top_p: 0.9
+
+# Output directory
+output_dir: "data/ecomm"
+
+# Event dates
+event_date_this_year: "2025-09-24"
+event_date_last_year: "2024-09-24"
+
+# Valid badge types
+valid_badge_types:
+  - "Visitor"
+  - "VIP"
+
+# Shows for this year (for filtering)
+shows_this_year:
+  - "ECE25"
+
+# Questions to keep (for demographic analysis)
+questions_to_keep:
+  current:
+    - 'What best describes what you do'
+    - 'What is your industry'
+    - 'What is your job role'
+    - 'Why are you attending'
+    - 'What is the main solution you are most excited to discover at the show'
+
+  past:
+    - 'What best describes your specialism'
+    - 'What best describes your company'
+    - 'What is your job role'
+    - 'Why are you attending'
+    - 'What is your main area of interest'
+    - 'What products are you interested in'
+
+# Question text corrections mapping
+# This section maps incorrect question text to corrected versions
+# Applied after punctuation removal in demographic data processing
+question_text_corrections:
+  'What best describes your what you do': 'What best describes what you do'
+  'What is the main  solution you are most excited to discover at the show': 'What is the main solution you are most excited to discover at the show'
+  'What is your organisations annual turnover': 'What is your organisation annual turnover'
+
+# Logging configuration
+logging:
+  level: "INFO"
+  file: "data_processing.log"

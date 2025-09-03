@@ -1,0 +1,346 @@
+# Event-specific configuration for BVA events
+# This configuration file contains all event-specific settings and output file names
+
+# Event configuration 
+event:
+  name: "bva"
+  main_event: "bva"
+  main_event_name: "bva"  # This will trigger vet-specific functions
+  secondary_event_name: "lva"
+  year: 2025
+  shows_this_year:
+    - "BVA2025"
+  shows_last_year_main:
+    - "BVA2024"
+  shows_last_year_secondary:
+    - "LVS2024"
+
+# Badge history column names
+badge_history_columns:
+  main_event: "BadgeId_last_year_bva"
+  secondary_event: "BadgeId_last_year_lva"
+
+# Practice type column names for different years
+practice_type_columns:
+  current: "what_type_does_your_practice_specialise_in"
+  past: "what_areas_do_you_specialise_in"
+
+# Practice matching configuration
+practice_matching:
+  company_column: "Company Name"
+  practice_type_column: "Main Type of Veterinary Practice"
+  match_threshold: 95
+
+# Job role processing configuration
+job_role_question: "What is your job role"
+
+# Output file configurations
+output_files:
+  professions_list: "list_of_professions.csv"
+  specializations: "specializations.json"
+  job_roles: "job_roles.json"
+  raw_data:
+    main_event_registration: "Registration_data_bva.csv"
+    secondary_event_registration: "Registration_data_lva.csv"
+    main_event_demographic: "Registration_demographicdata_bva.csv"
+    secondary_event_demographic: "Registration_demographicdata_lva.csv"
+  processed_data:
+    this_year: "Registration_data_bva_25_only_valid.csv"
+    last_year_main: "Registration_data_bva_24_only_valid.csv"
+    returning_main: "Registration_data_bva_24_25_only_valid.csv"
+    returning_secondary: "Registration_data_lva_24_25_only_valid.csv"
+  demographic_data:
+    this_year: "Registration_demographicdata_bva_25_raw.csv"
+    last_year_main: "Registration_demographicdata_bva_24_raw.csv"
+    last_year_secondary: "Registration_demographicdata_lva_24_raw.csv"
+  returning_demographic_data:
+    main_event: "Registration_demographicdata_bva_24_25.csv"
+    secondary_event: "Registration_demographicdata_lva_24_25.csv"
+  registration_with_demographic:
+    this_year: "Registration_data_with_demographicdata_bva_this.csv"
+    last_year_main: "Registration_data_with_demographicdata_bva_last.csv"
+    last_year_secondary: "Registration_data_with_demographicdata_lva_last.csv"
+  concatenated_registration_data:
+    this_year: "bva_registration_data_this_year.json"
+    past_year_main: "bva_registration_data_past_year.json"
+    past_year_secondary: "lva_registration_data_past_year.json"
+  processed_demographic_data:
+    this_year: "demographic_data_this.json"
+    last_year_main: "demographic_data_last_bva.json"
+    last_year_secondary: "demographic_data_last_lva.json"
+  combined_demographic_registration:
+    this_year: "df_reg_demo_this.csv"
+    last_year_main: "df_reg_demo_last_bva.csv"
+    last_year_secondary: "df_reg_demo_last_lva.csv"
+  recommendations:
+    output_directory: "recommendations"  # Subdirectory for recommendations
+    filename_pattern: "visitor_recommendations_{timestamp}"  # Pattern for output files
+    save_csv: true
+
+# Scan processor output files configuration
+scan_output_files:
+  processed_scans:
+    this_year: "scan_this_filtered_valid_cols.csv"
+    last_year_main: "scan_last_filtered_valid_cols_bva.csv"
+    last_year_secondary: "scan_last_filtered_valid_cols_lva.csv"
+
+# Pipeline control settings
+create_only_new: false  # If true, only process new visitors without recommendations
+
+# Pipeline step activation settings
+pipeline_steps:
+  # Data processing steps
+  registration_processing: true
+  scan_processing: true  
+  session_processing: true
+  # Neo4j processing steps
+  neo4j_visitor_processing: true
+  neo4j_session_processing: true
+  neo4j_job_stream_processing: true
+  neo4j_specialization_stream_processing: true
+  neo4j_visitor_relationship_processing: true
+  session_embedding_processing: true
+  session_recommendation_processing: true
+
+# Input file paths
+input_files:
+  main_event_registration: "data/bva/20250609_registration_BVA24_BVA25.json"
+  secondary_event_registration: "data/bva/20250428_registration_LVS24.json"
+  main_event_demographic: "data/bva/20250609_demographics_BVA24_BVA25.json"
+  secondary_event_demographic: "data/bva/20250428_demographics_LVS24.json"
+  practices: "data/bva/practices_missing.csv"
+  # main_event_scan: "data/bva/20240723_scan_data_BVA25.json"
+  # secondary_event_scan: "data/bva/20240724_scan_data_LVS25.json"
+  # main_event_sessions: "data/bva/20240725_sessions_BVA25.json"
+  # secondary_event_sessions: "data/bva/20240726_sessions_LVS25.json"
+
+# Scan data configuration
+scan_files:
+  session_this: "data/bva/BVA25_session_export.csv"
+  session_past_main: "data/bva/BVA24_session_export.csv"
+  session_past_secondary: "data/bva/LVA24_session_export.csv"
+  seminars_scan_reference_past_main: "data/bva/bva2024 seminar scans reference.csv"
+  seminars_scans_past_main: "data/bva/bva2024 seminar scans.csv"
+  seminars_scan_reference_past_secondary: "data/bva/lvs2024 seminar scans reference.csv"
+  seminars_scans_past_secondary: "data/bva/lvs2024 seminar scans.csv"
+
+# Session output file configuration
+session_output_files:
+  processed_sessions:
+    this_year: "session_this_filtered_valid_cols.csv"
+    last_year_main: "session_last_filtered_valid_cols_bva.csv"
+    last_year_secondary: "session_last_filtered_valid_cols_lva.csv"
+  streams_catalog: "streams.json"
+# Session data file paths
+session_files:
+  session_this: "data/bva/BVA25_session_export.csv"
+  session_past_bva: "data/bva/BVA24_session_export.csv"
+  session_past_lva: "data/bva/LVA24_session_export.csv"
+
+stream_processing:
+  use_cached_descriptions: true
+# Session processing configuration
+# BVA-specific titles to remove during session filtering
+titles_to_remove:
+  - "exhibitor showcase"
+  - "tbc session"
+  - "-"
+  - "session tba"
+  - "Session title to be confirmed"
+  - "session title to be confirm"
+  - "session details to follow"
+
+# BVA-specific veterinary abbreviation mappings
+map_vets:
+  "RCVS": "Royal College of Veterinary Surgeons"
+  "VPG": "Veterinary Pathology Group"
+  "IDEXX": "IDEXX Laboratories"
+  "VCMS": "Veterinary Client Mediation Service"
+  "NVS": "National Veterinary Services"
+  "ACD": "ACD Labs"
+  "VMD": "The Veterinary Medicines Directorate"
+  "TVM": "TVM Uk"
+  "IVAMP": "International Veterinary Academy of Pain Management"
+  "JAK": "JAK Marketing"
+  "DMS": "DMS Veterinary"
+  "VRS": "Veterinarian Recommended Solutions"
+  "No Data": "Not Sponsored"
+  "BVZS": "British Veterinary Zoological Society"
+  "BSAVA": "British Small Animal Veterinary Association"
+  "BCVA": "Bristol Commercial Valuers and Auctioneers"
+  "PVS": "Pig Veterinary Society"
+  "BVPA": "British Veterinary Poultry Association"
+  "BBVA": "British Bee Veterinary Association"
+  "BVCS": "Bachelor of Veterinary Science"
+  "BVDA": "British Veterinary Dental Association"
+  "DEFRA": "Department for Environment, Food & Rural Affairs"
+  "Agria": "Agria Pet Insurance Limited"
+  "Cubex": "Veterinary Practice Software"
+  "Forte": "Forte Healthcare Ltd"
+  "Lupa": "LUPA PETS LTD"
+  "iM3": "iM3 The Global Name in Veterinary Dentistry"
+  "Omni": "Omni Pet Limited"
+  "WVS" : "Worldwide Veterinary Service"
+
+# Embedding configuration
+embeddings:
+  model: "all-MiniLM-L6-v2"     # Model to use for generating session embeddings
+  batch_size: 100               # Batch size for processing embeddings
+  include_stream_descriptions: false  # Whether to include stream descriptions in embeddings
+
+# Session recommendation configuration
+
+recommendation:
+  min_similarity_score: 0.3       # Minimum similarity score (0.0-1.0) for recommendations
+  max_recommendations: 10         # Maximum number of recommendations per visitor
+  similar_visitors_count: 3       # Number of similar visitors to consider for new visitors
+  use_langchain: false            # Whether to use LangChain for filtering (requires LangChain)
+  enable_filtering: true          # Enable/disable filtering rules (true for vet shows)
+  
+  # Similarity attributes for finding similar visitors (vet-specific)
+  similarity_attributes:
+    job_role: 1.0                                         # Weight for job role matching
+    what_type_does_your_practice_specialise_in: 1.0      # Weight for practice type
+    organisation_type: 1.0                               # Weight for organization type
+    Country: 1.0                                          # Weight for country
+
+  role_groups:
+    vet_roles:
+      - "Vet/Vet Surgeon"
+      - "Assistant Vet"
+      - "Vet/Owner"
+      - "Clinical or other Director"
+      - "Locum Vet"
+      - "Academic"
+    nurse_roles:
+      - "Head Nurse/Senior Nurse"
+      - "Vet Nurse"
+      - "Locum RVN"
+    business_roles:
+      - "Practice Manager"
+      - "Practice Partner/Owner"
+    other_roles:
+      - "Student"
+      - "Receptionist"
+      - "Other (please specify)"
+  
+  # NEW: Add field mappings
+  field_mappings:
+    practice_type_field: "what_type_does_your_practice_specialise_in"
+    job_role_field: "job_role"
+  
+  # Filtering rules configuration (vet-specific)
+  rules_config:
+    equine_mixed_exclusions: ["exotics", "feline", "exotic animal", "farm", "small animal"]
+    small_animal_exclusions: ["equine", "farm animal", "farm", "large animal"]
+    vet_exclusions: ["nursing"]
+    nurse_streams: ["nursing", "wellbeing", "welfare"]
+    rule_priority: ["practice_type", "role"]  # Order of rule application
+
+# Neo4j configuration
+neo4j:
+  uri: "neo4j+s://928872b4.databases.neo4j.io"
+  username: "neo4j"
+  password: ""  
+  show_name: "bva"  
+  node_labels:
+    visitor_this_year: "Visitor_this_year"
+    visitor_last_year_bva: "Visitor_last_year_bva"
+    visitor_last_year_lva: "Visitor_last_year_lva"
+    session_this_year: "Sessions_this_year"
+    session_past_year: "Sessions_past_year"
+    stream: "Stream"
+  unique_identifiers:
+    visitor: "BadgeId"  # Field to use as unique identifier for visitor nodes
+    session: "session_id"  # Field to use as unique identifier for session nodes
+    stream: "stream"  # Field to use as unique identifier for stream nodes
+  relationships:
+    session_stream: "HAS_STREAM"  # Relationship between sessions and streams
+    job_stream: "job_to_stream"  # Relationship between job roles and streams
+    specialization_stream: "specialization_to_stream"  # Relationship between specializations and streams
+    same_visitor: "Same_Visitor"  # Relationship between visitors this year and last year
+    attended_session: "attended_session"  # Relationship between visitors and sessions they attended
+  
+  # ENHANCED: Job stream mapping configuration with enable support
+  job_stream_mapping:
+    enabled: true  # ENHANCED: Enable job stream processing for BVA shows
+    file: "job_to_stream.csv"  # File containing job to stream mappings
+    job_role_field: "job_role"  # Field containing job role information
+    
+  # ENHANCED: Specialization stream mapping configuration with enable support
+  specialization_stream_mapping:
+    enabled: true  # ENHANCED: Enable specialization stream processing for BVA shows
+    file: "spezialization_to_stream.csv"  # File containing specialization to stream mapping
+    specialization_field_this_year: "what_type_does_your_practice_specialise_in"
+    specialization_field_bva: "what_areas_do_you_specialise_in"
+    specialization_field_lva: "what_areas_do_you_specialise_in"
+    specialization_map: {
+      # BVA-specific specialization mapping
+      "Wildlife": "Other",
+      "Small Animal": "Companion Animal",
+      "Mixed": "Other",
+      "Dairy": "Farm",
+      "Poultry": "Farm",
+      "Cattle": "Farm",
+      "Pigs": "Farm",
+      "Sheep": "Farm"
+    }
+  
+  visitor_relationship:
+    same_visitor_properties:
+      bva: { type: "bva" }  # Properties for BVA Same_Visitor relationships
+      lva: { type: "lva" }  # Properties for LVA Same_Visitor relationships
+
+# Default properties for visitor nodes
+default_visitor_properties:
+  Days_since_registration: "119"
+  Country: "UK"
+  Source: "BVA Key Stakeholders"
+  Email_domain: "vetpractice.co.uk"
+  assist_year_before: "1"
+  job_role: "NA"
+  what_type_does_your_practice_specialise_in: "NA"
+  organisation_type: "NA"
+  JobTitle: "NA"
+  show: "bva"
+
+# Environment file path
+env_file: "keys/.env"
+
+# Language model configuration
+language_model:
+  model: "gpt-4o-mini"
+  temperature: 0.5
+  top_p: 0.9
+
+# Output directory
+output_dir: "data/bva"
+
+# Event dates
+event_date_this_year: "2025-06-12"
+event_date_last_year: "2024-06-12"
+
+# Valid badge types
+valid_badge_types:
+  - "Delegate"
+  - "Delegate - Group"
+
+# Shows for this year (for filtering)
+shows_this_year:
+  - "BVA2025"
+
+# Questions to keep (for demographic analysis)
+questions_to_keep:
+  current:
+    - "What type does your practice specialise in"
+    - "Organisation Type"
+    - "Job Role"
+  past:
+    - "What areas do you specialise in"
+    - "Organisation Type"
+    - "Job Role"
+
+# Logging configuration
+logging:
+  level: "INFO"
+  file: "data_processing.log"

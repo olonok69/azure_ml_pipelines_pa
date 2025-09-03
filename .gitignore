@@ -100,8 +100,7 @@ comparison_output/
 comparison_output_scan/
 comparison_output_session/
 PA/comparers/reports/
-PA/config/config_ecomm.yaml
-PA/config/config_vet.yaml
+
 notebooks/.ipynb_aml_checkpoints/
 .amlignore
 .amlignore.amltmp
