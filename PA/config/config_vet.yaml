@@ -77,12 +77,7 @@ output_files:
     filename_pattern: "visitor_recommendations_{timestamp}"  # Pattern for output files
     save_csv: true
 
-# Scan processor output files configuration
-scan_output_files:
-  processed_scans:
-    this_year: "scan_this_filtered_valid_cols.csv"
-    last_year_main: "scan_last_filtered_valid_cols_bva.csv"
-    last_year_secondary: "scan_last_filtered_valid_cols_lva.csv"
+
 
 # Pipeline control settings
 create_only_new: false  # If true, only process new visitors without recommendations
@@ -124,6 +119,17 @@ scan_files:
   seminars_scan_reference_past_secondary: "data/bva/lvs2024 seminar scans reference.csv"
   seminars_scans_past_secondary: "data/bva/lvs2024 seminar scans.csv"
 
+# Scan output files
+scan_output_files:
+  processed_scans:
+    last_year_main: "scan_bva_past.csv"   # Changed from bva to ecomm
+    last_year_secondary: "scan_lva_past.csv"  # Changed from lva to tfm
+# Session data file paths
+session_files:
+  session_this: "data/bva/BVA25_session_export.csv"
+  session_past_bva: "data/bva/BVA24_session_export.csv"
+  session_past_lva: "data/bva/LVA24_session_export.csv"
+
 # Session output file configuration
 session_output_files:
   processed_sessions:
@@ -131,11 +137,8 @@ session_output_files:
     last_year_main: "session_last_filtered_valid_cols_bva.csv"
     last_year_secondary: "session_last_filtered_valid_cols_lva.csv"
   streams_catalog: "streams.json"
-# Session data file paths
-session_files:
-  session_this: "data/bva/BVA25_session_export.csv"
-  session_past_bva: "data/bva/BVA24_session_export.csv"
-  session_past_lva: "data/bva/LVA24_session_export.csv"
+
+
 
 stream_processing:
   use_cached_descriptions: true
