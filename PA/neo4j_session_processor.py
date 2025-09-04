@@ -436,7 +436,7 @@ class Neo4jSessionProcessor:
             # Process sessions from last year (main event)
             self.logger.info(f"Processing sessions from last year {self.main_event_name}")
             csv_file_path = os.path.join(
-                self.output_dir, f"output/session_last_filtered_valid_cols_{self.main_event_name}.csv"
+                self.output_dir, "output/session_last_filtered_valid_cols_bva.csv"
             )
             data = pd.read_csv(csv_file_path)
             properties_map = {col: col for col in data.columns}
@@ -456,7 +456,7 @@ class Neo4jSessionProcessor:
             # Process sessions from last year (secondary event)
             self.logger.info(f"Processing sessions from last year {self.secondary_event_name}")
             csv_file_path = os.path.join(
-                self.output_dir, f"output/session_last_filtered_valid_cols_{self.secondary_event_name}.csv"
+                self.output_dir, "output/session_last_filtered_valid_cols_lva.csv"
             )
             data = pd.read_csv(csv_file_path)
             properties_map = {col: col for col in data.columns}
