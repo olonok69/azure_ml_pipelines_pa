@@ -293,8 +293,6 @@ class SessionRecommendationProcessor:
                         if weight > 0 and attr in visitor and visitor[attr] not in [None, "NA", ""]:
                             # Map the attribute name if needed
                             neo4j_attr = attr
-                            if attr == self.job_role_field:
-                                neo4j_attr = "job_role"  # Map to standard field in DB
                             
                             where_clauses.append(f"v2.{neo4j_attr} = $attr_{attr}")
                             params[f"attr_{attr}"] = visitor[attr]
