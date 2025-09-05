@@ -104,44 +104,73 @@ class RecommendationsStep:
         return os.environ.get('AZUREML_RUN_ID') is not None
     
     def _load_keyvault_secrets(self):
-        kv_name = os.getenv("KEYVAULT_NAME")
-        if not kv_name:
-            self.logger.warning("KEYVAULT_NAME not set – skipping Key Vault")
-            return {}
-        self.logger.info(f"Attempting to load Neo4j secrets from Key Vault '{kv_name}'")
-        kv = KeyVaultManager(kv_name)
-        mapping = {
-            "neo4j-uri": "NEO4J_URI",
-            "neo4j-username": "NEO4J_USERNAME",
-            "neo4j-password": "NEO4J_PASSWORD",
-        }
-        found = {}
-        for kv_key, env_key in mapping.items():
-            try:
-                val = kv.get_secret(kv_key)
-            except Exception as e:
-                self.logger.error(f"Key Vault retrieval error {kv_key}: {e}")
-                val = None
-            if val:
-                os.environ[env_key] = val.strip()
-                found[env_key] = "***" if "PASSWORD" in env_key else val
-        if not found:
-            self.logger.warning("No Neo4j secrets retrieved from Key Vault (will rely on existing env vars)")
-        else:
-            self.logger.info(f"Loaded secrets from Key Vault: {list(found.keys())}")
-        return found
+        """Load secrets from Key Vault or environment variables.
+        This method now uses the same approach as Step 1 to avoid authentication issues.
+        """
+        try:
+            # First check if Neo4j credentials are already in environment
+            neo4j_uri = os.environ.get("NEO4J_URI")
+            neo4j_username = os.environ.get("NEO4J_USERNAME")
+            neo4j_password = os.environ.get("NEO4J_PASSWORD")
+            
+            if all([neo4j_uri, neo4j_username, neo4j_password]):
+                self.logger.info("Neo4j credentials found in environment variables")
+                return {
+                    "NEO4J_URI": neo4j_uri,
+                    "NEO4J_USERNAME": neo4j_username,
+                    "NEO4J_PASSWORD": "***"
+                }
+            
+            # If not all credentials are in environment, try to load from Key Vault
+            kv_name = os.getenv("KEYVAULT_NAME", "strategicai-kv-uks-dev")
+            self.logger.info(f"Neo4j credentials not complete in environment, trying Key Vault: {kv_name}")
+            
+            # Use ensure_env_file like Step 1 does
+            env_path = os.path.join(project_root, "PA", "keys", ".env")
+            if ensure_env_file(kv_name, env_path):
+                # Load the created .env file
+                load_dotenv(env_path)
+                self.logger.info("Successfully loaded secrets from Key Vault via .env file")
+                
+                # Check if credentials are now available
+                neo4j_uri = os.environ.get("NEO4J_URI")
+                neo4j_username = os.environ.get("NEO4J_USERNAME")
+                neo4j_password = os.environ.get("NEO4J_PASSWORD")
+                
+                if all([neo4j_uri, neo4j_username, neo4j_password]):
+                    return {
+                        "NEO4J_URI": neo4j_uri,
+                        "NEO4J_USERNAME": neo4j_username,
+                        "NEO4J_PASSWORD": "***"
+                    }
+            else:
+                self.logger.warning("Could not load secrets from Key Vault, relying on environment variables")
+                
+        except Exception as e:
+            self.logger.error(f"Error loading secrets: {e}")
+            self.logger.info("Falling back to environment variables")
+        
+        return {}
     
     def _ensure_neo4j_credentials(self):
-        # Retry Key Vault if variables still missing
+        """Ensure Neo4j credentials are available from environment or Key Vault."""
         needed = ["NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"]
-        if any(not os.getenv(k) for k in needed):
+        
+        # Check if all credentials are already available
+        missing = [k for k in needed if not os.getenv(k)]
+        
+        if missing:
+            self.logger.info(f"Missing credentials: {missing}, attempting to load...")
             self._load_keyvault_secrets()
-
+            
+            # Check again after loading
+            missing = [k for k in needed if not os.getenv(k)]
+        
+        # Clean up any whitespace
         for k in needed:
             if os.getenv(k):
                 os.environ[k] = os.getenv(k).strip()
-
-        missing = [k for k in needed if not os.getenv(k)]
+        
         if missing:
             raise RuntimeError(f"Missing Neo4j credentials after Key Vault/environment fallback: {missing}")
 
