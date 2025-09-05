@@ -32,6 +32,7 @@ from azure.identity import (
 )
 from azure.ai.ml import MLClient
 
+
 # Add project root to path for PA imports
 root_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(root_dir)
@@ -49,7 +50,29 @@ from PA.session_recommendation_processor import SessionRecommendationProcessor
 from PA.utils.config_utils import load_config
 from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
+import mlflow
+from neo4j import GraphDatabase
 
+
+def _in_azureml_run() -> bool:
+    return bool(os.getenv("AZUREML_RUN_ID"))
+
+def configure_mlflow(logger):
+    if not _in_azureml_run():
+        logger.info("Not inside Azure ML run context – leaving MLflow config unchanged")
+        return
+    if os.getenv("FORCE_AZUREML_MLFLOW", "false").lower() == "true":
+        if os.getenv("MLFLOW_TRACKING_URI", "").startswith("databricks"):
+            os.environ.pop("MLFLOW_TRACKING_URI", None)
+            logger.info("Removed Databricks MLFLOW_TRACKING_URI for Azure ML logging")
+    try:
+        mlflow.set_experiment("personal_agendas_complete")
+        # Ensure an active run (Azure ML usually auto-starts; guard anyway)
+        if mlflow.active_run() is None:
+            mlflow.start_run()
+        logger.info("MLflow experiment & run ready")
+    except Exception as e:
+        logger.warning(f"MLflow configuration warning: {e}")
 
 class RecommendationsStep:
     """Azure ML Recommendations Step for Personal Agendas pipeline."""
@@ -67,18 +90,78 @@ class RecommendationsStep:
         self.incremental = incremental
         self.use_keyvault = use_keyvault
         self.logger = self._setup_logging()
-        
-        # Load secrets from Key Vault if in Azure ML
-        if self.use_keyvault and self._is_azure_ml_environment():
-            self._load_secrets_from_keyvault()
-        
+
+        # Load config early
         self.config = self._load_configuration(config_path)
-        # For recommendation processor, incremental means create_only_new
         self.create_only_new = self.incremental
+
+        # Robust secret load (non-fatal). Do not declare success unless something found.
+        if self.use_keyvault and self._is_azure_ml_environment():
+            self._load_keyvault_secrets()
     
     def _is_azure_ml_environment(self) -> bool:
         """Check if running in Azure ML environment."""
         return os.environ.get('AZUREML_RUN_ID') is not None
+    
+    def _load_keyvault_secrets(self):
+        kv_name = os.getenv("KEYVAULT_NAME")
+        if not kv_name:
+            self.logger.warning("KEYVAULT_NAME not set – skipping Key Vault")
+            return {}
+        self.logger.info(f"Attempting to load Neo4j secrets from Key Vault '{kv_name}'")
+        kv = KeyVaultManager(kv_name)
+        mapping = {
+            "neo4j-uri": "NEO4J_URI",
+            "neo4j-username": "NEO4J_USERNAME",
+            "neo4j-password": "NEO4J_PASSWORD",
+        }
+        found = {}
+        for kv_key, env_key in mapping.items():
+            try:
+                val = kv.get_secret(kv_key)
+            except Exception as e:
+                self.logger.error(f"Key Vault retrieval error {kv_key}: {e}")
+                val = None
+            if val:
+                os.environ[env_key] = val.strip()
+                found[env_key] = "***" if "PASSWORD" in env_key else val
+        if not found:
+            self.logger.warning("No Neo4j secrets retrieved from Key Vault (will rely on existing env vars)")
+        else:
+            self.logger.info(f"Loaded secrets from Key Vault: {list(found.keys())}")
+        return found
+    
+    def _ensure_neo4j_credentials(self):
+        # Retry Key Vault if variables still missing
+        needed = ["NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"]
+        if any(not os.getenv(k) for k in needed):
+            self._load_keyvault_secrets()
+
+        for k in needed:
+            if os.getenv(k):
+                os.environ[k] = os.getenv(k).strip()
+
+        missing = [k for k in needed if not os.getenv(k)]
+        if missing:
+            raise RuntimeError(f"Missing Neo4j credentials after Key Vault/environment fallback: {missing}")
+
+        uri = os.environ["NEO4J_URI"]
+        user = os.environ["NEO4J_USERNAME"]
+        pwd = os.environ["NEO4J_PASSWORD"]
+
+        self.logger.info("Verifying Neo4j connectivity...")
+        try:
+            drv = GraphDatabase.driver(uri, auth=(user, pwd))
+            drv.verify_connectivity()
+            self.logger.info("Neo4j connectivity verified")
+        except Exception as e:
+            raise RuntimeError(f"Neo4j connectivity test failed: {e}") from e
+        finally:
+            try: drv.close()
+            except: pass
+
+        self.config.setdefault("neo4j", {})
+        self.config["neo4j"].update({"uri": uri, "username": user, "password": pwd})
     
     def _setup_logging(self) -> logging.Logger:
         """Setup logging configuration."""
@@ -127,35 +210,6 @@ class RecommendationsStep:
             self.logger.warning("Using DefaultAzureCredential as fallback")
             return DefaultAzureCredential()
     
-    def _load_secrets_from_keyvault(self):
-        """Load secrets from Azure Key Vault."""
-        try:
-            self.logger.info("Loading secrets from Azure Key Vault")
-            
-            # Get Key Vault name from environment or use default
-            kv_name = os.environ.get("KEYVAULT_NAME", "strategicai-kv-uks-dev")
-            
-            # Create Key Vault Manager
-            kv_manager = KeyVaultManager(kv_name)
-            
-            # Get Neo4j credentials
-            neo4j_secrets = {
-                "NEO4J_URI": kv_manager.get_secret("neo4j-uri"),
-                "NEO4J_USERNAME": kv_manager.get_secret("neo4j-username"),
-                "NEO4J_PASSWORD": kv_manager.get_secret("neo4j-password")
-            }
-            
-            # Set as environment variables
-            for key, value in neo4j_secrets.items():
-                if value:
-                    os.environ[key] = value
-                    self.logger.info(f"Loaded {key} from Key Vault")
-            
-            self.logger.info("Successfully loaded all secrets from Key Vault")
-            
-        except Exception as e:
-            self.logger.warning(f"Could not load secrets from Key Vault: {e}")
-            self.logger.info("Will fall back to environment variables or .env file")
     
     def _load_configuration(self, config_path: str) -> Dict:
         """
@@ -183,6 +237,8 @@ class RecommendationsStep:
         
         return config
     
+
+
     def setup_data_directories(self, root_dir: str) -> Dict[str, str]:
         """
         Setup necessary data directories.
@@ -207,75 +263,47 @@ class RecommendationsStep:
         return directories
     
     def run_recommendation_processing(self) -> Dict[str, Any]:
-        """
-        Run the recommendation processor.
-        
-        Returns:
-            Dictionary containing processing results
-        """
         try:
             self.logger.info("Initializing Session Recommendation Processor")
-            
             processor = SessionRecommendationProcessor(self.config)
-            
             self.logger.info("Running recommendation processing...")
             processor.process()
-            
-            # Get statistics
-            statistics = processor.statistics if hasattr(processor, 'statistics') else {}
-            
-            # Build result dictionary
-            result_dict = {
-                'status': 'success',
-                'statistics': statistics,
-                'output_files': {}
-            }
-            
-            # Check for output files
-            output_dir = Path(root_dir) / 'data' / 'output'
+
+            statistics = getattr(processor, 'statistics', {})
+            result_dict = {'status': 'success', 'statistics': statistics, 'output_files': {}}
+
             show_name = self.config.get('event', {}).get('name', 'ecomm')
-            
-            # Look for JSON and CSV files
-            json_pattern = output_dir / f"recommendations/visitor_recommendations_{show_name}_*.json"
-            json_files = list(output_dir.glob(f"recommendations/visitor_recommendations_*.json"))
-            
+            output_dir = Path(root_dir) / 'data' / 'output' / 'recommendations'
+            # Only match current show
+            pattern = f"visitor_recommendations_{show_name}_*.json"
+            json_files = list(output_dir.glob(pattern))
+
             if json_files:
-                # Get the most recent file
                 most_recent_json = max(json_files, key=lambda p: p.stat().st_mtime)
-                result_dict['output_file'] = str(most_recent_json)
                 result_dict['output_files']['json'] = str(most_recent_json)
-                
-                # Check for corresponding CSV
-                csv_file = Path(str(most_recent_json).replace('.json', '.csv'))
-                if csv_file.exists():
-                    result_dict['output_files']['csv'] = str(csv_file)
-                    self.logger.info(f"Found CSV recommendations: {csv_file}")
-                
-                # Check for corresponding Parquet
-                parquet_file = Path(str(most_recent_json).replace('.json', '.parquet'))
-                if parquet_file.exists():
-                    result_dict['output_files']['parquet'] = str(parquet_file)
-                    self.logger.info(f"Found Parquet recommendations: {parquet_file}")
-                
-                self.logger.info(f"JSON recommendations saved to: {most_recent_json}")
-                
-                # Load and get basic stats
+                # Optional companion formats
+                for ext in ('.csv', '.parquet'):
+                    candidate = most_recent_json.with_suffix(ext)
+                    if candidate.exists():
+                        result_dict['output_files'][ext.lstrip('.')] = str(candidate)
+
+                # Basic stats enrichment
                 try:
                     with open(most_recent_json, 'r') as f:
                         data = json.load(f)
-                        if 'recommendations' in data:
-                            result_dict['statistics']['total_rows'] = len(data['recommendations'])
-                            result_dict['statistics']['unique_visitors'] = len(data['recommendations'])
-                except:
-                    pass
-            
-            self.logger.info(f"Recommendation processing completed with statistics: {result_dict.get('statistics', {})}")
+                        recs = data.get('recommendations', [])
+                        result_dict['statistics'].setdefault('total_rows', len(recs))
+                        # If structure is list of visitor objects, adjust as needed
+                        result_dict['statistics'].setdefault('unique_visitors', len(recs))
+                except Exception as e:
+                    self.logger.debug(f"Could not enrich statistics from JSON: {e}")
+
+            self.logger.info(f"Recommendation processing completed: {result_dict['statistics']}")
             return result_dict
-            
         except Exception as e:
             self.logger.error(f"Error in recommendation processing: {e}")
-            traceback.print_exc()
-            return {'status': 'failed', 'error': str(e)}
+            self.logger.debug(traceback.format_exc())
+            return {'status': 'failed', 'error': str(e), 'statistics': {}}
     
     def save_outputs(self, results: Dict[str, Any], output_dir: str):
         """
@@ -367,7 +395,7 @@ class RecommendationsStep:
                 from azure.storage.blob import BlobServiceClient
                 
                 # Get configuration
-                event_name = self.config.get('event', {}).get('event_name', 'ecomm')
+                event_name = self.config.get('event', {}).get('name', 'ecomm')
                 
                 # Parse the storage account from environment or use default
                 storage_account = os.environ.get('STORAGE_ACCOUNT_NAME', 'strategicaistuksdev02')
@@ -485,43 +513,33 @@ class RecommendationsStep:
                     self.logger.info("Files are saved in the Azure ML output directory and can be accessed through the Azure ML Studio")
     
     def process(self) -> Dict[str, Any]:
-        """
-        Main processing method for recommendations step.
-        
-        Returns:
-            Dictionary containing results from the processor
-        """
+        configure_mlflow(self.logger)
+        self._ensure_neo4j_credentials()
+
         self.logger.info("=" * 60)
         self.logger.info("Starting Recommendations Step")
         self.logger.info(f"Configuration: {self.config_path}")
         self.logger.info(f"Incremental: {self.incremental}")
         self.logger.info("=" * 60)
-        
-        # Setup directories
-        directories = self.setup_data_directories(root_dir)
-        
-        # Initialize results
+
+        self.setup_data_directories(root_dir)
         results = {}
-        
-        # Run recommendation processing
-        processors_config = self.config.get('processors', {})
-        
-        if processors_config.get('session_recommendation_processing', {}).get('enabled', True):
+        processors_cfg = self.config.get('processors', {})
+        enabled = processors_cfg.get('session_recommendation_processing', {}).get('enabled', True)
+
+        if enabled:
             self.logger.info("\n" + "=" * 40)
             self.logger.info("SESSION RECOMMENDATION PROCESSING")
             self.logger.info("=" * 40)
             results['recommendations'] = self.run_recommendation_processing()
         else:
-            self.logger.info("Session recommendation processing is disabled in configuration")
-            results['recommendations'] = {
-                'status': 'skipped',
-                'reason': 'Disabled in configuration'
-            }
-        
+            msg = "Session recommendation processing disabled in configuration"
+            self.logger.info(msg)
+            results['recommendations'] = {'status': 'skipped', 'reason': msg, 'statistics': {}}
+
         self.logger.info("\n" + "=" * 60)
         self.logger.info("Recommendations Step Completed")
         self.logger.info("=" * 60)
-        
         return results
 
 
@@ -594,35 +612,25 @@ def main(args):
     step = RecommendationsStep(args.config, args.incremental)
     
     # Run processing
-    results = step.process()
-    
-    # Save outputs
+    try:
+        results = step.process()
+    except Exception as e:
+        # Fatal pre-processing failure (likely credentials)
+        print(f"FATAL: {e}")
+        traceback.print_exc()
+        results = {'recommendations': {'status': 'failed', 'error': str(e), 'statistics': {}}}
+
     step.save_outputs(results, args.output_metadata)
-    
-    # Setup MLflow (optional - won't fail if not available)
-    mlflow_enabled = setup_azure_ml_mlflow()
-    
-    # Log metrics if MLflow is available
-    if mlflow_enabled:
-        try:
-            rec_result = results.get('recommendations', {})
-            stats = rec_result.get('statistics', {})
-            
-            if stats:
-                metrics = {
-                    'visitors_processed': stats.get('visitors_processed', 0),
-                    'visitors_with_recommendations': stats.get('visitors_with_recommendations', 0),
-                    'visitors_without_recommendations': stats.get('visitors_without_recommendations', 0),
-                    'recommendations_generated': stats.get('total_recommendations_generated', 0),
-                    'filtered_recommendations': stats.get('total_filtered_recommendations', 0),
-                    'errors': stats.get('errors', 0),
-                    'processing_time': stats.get('processing_time', 0)
-                }
-                
-                log_metrics_to_mlflow(metrics)
-                print(f"Logged {len(metrics)} metrics to MLflow")
-        except Exception as e:
-            print(f"Could not log to MLflow: {e}")
+
+    # Remove duplicate MLflow setup (configure_mlflow already called)
+    if mlflow.active_run():
+        rec_stats = results.get('recommendations', {}).get('statistics', {})
+        for k, v in rec_stats.items():
+            if isinstance(v, (int, float)):
+                try:
+                    mlflow.log_metric(f"step4_{k}", v)
+                except Exception:
+                    pass
     
     # Print summary
     print("\n" + "=" * 60)
@@ -630,7 +638,7 @@ def main(args):
     print("=" * 60)
     print(f"Configuration: {args.config}")
     print(f"Incremental: {args.incremental}")
-    print(f"MLflow Tracking: {'Enabled' if mlflow_enabled else 'Disabled'}")
+
     print(f"Results:")
     
     # Print statistics

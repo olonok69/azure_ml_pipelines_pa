@@ -4,7 +4,12 @@ Azure Key Vault utilities for Personal Agendas pipeline.
 import os
 import logging
 from typing import Dict, Optional
-from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+from azure.identity import (
+    ManagedIdentityCredential,
+    ClientSecretCredential,
+    DefaultAzureCredential,
+    ChainedTokenCredential
+)
 from azure.keyvault.secrets import SecretClient
 from azure.core.exceptions import ResourceNotFoundError
 
@@ -14,17 +19,31 @@ logger = logging.getLogger(__name__)
 class KeyVaultManager:
     """Manage secrets from Azure Key Vault."""
     
-    def __init__(self, keyvault_name: Optional[str] = None):
-        """
-        Initialize Key Vault manager.
-        
-        Args:
-            keyvault_name: Name of the Key Vault (or from environment)
-        """
-        self.keyvault_name = keyvault_name or os.environ.get("KEYVAULT_NAME", "pa-keyvault-dev-01")
-        self.keyvault_url = f"https://{self.keyvault_name}.vault.azure.net"
-        self.client = None
-        self._secrets_cache = {}
+    def __init__(self, keyvault_name: str):
+        self.logger = logging.getLogger(__name__)
+        self.vault_url = f"https://{keyvault_name}.vault.azure.net"
+        chain = []
+
+        if os.getenv("AZURE_CLIENT_ID") and os.getenv("AZURE_CLIENT_SECRET") and os.getenv("AZURE_TENANT_ID"):
+            chain.append(
+                ClientSecretCredential(
+                    tenant_id=os.getenv("AZURE_TENANT_ID"),
+                    client_id=os.getenv("AZURE_CLIENT_ID"),
+                    client_secret=os.getenv("AZURE_CLIENT_SECRET"),
+                )
+            )
+            self.logger.info("KeyVault: added ClientSecretCredential")
+        try:
+            chain.append(ManagedIdentityCredential())
+            self.logger.info("KeyVault: added ManagedIdentityCredential")
+        except Exception as e:
+            self.logger.warning(f"KeyVault: MI unavailable: {e}")
+
+        # Broader fallback (excludes a second MI attempt)
+        chain.append(DefaultAzureCredential(exclude_managed_identity_credential=True))
+
+        self.credential = ChainedTokenCredential(*chain)
+        self.client = SecretClient(vault_url=self.vault_url, credential=self.credential)
         
     def _get_client(self) -> SecretClient:
         """Get or create Key Vault client."""
@@ -41,30 +60,11 @@ class KeyVaultManager:
                 logger.info("Using Default Credential for Key Vault access")
         return self.client
     
-    def get_secret(self, secret_name: str) -> Optional[str]:
-        """
-        Get a secret from Key Vault.
-        
-        Args:
-            secret_name: Name of the secret
-            
-        Returns:
-            Secret value or None if not found
-        """
-        # Check cache first
-        if secret_name in self._secrets_cache:
-            return self._secrets_cache[secret_name]
-        
+    def get_secret(self, name: str) -> str | None:
         try:
-            client = self._get_client()
-            secret = client.get_secret(secret_name)
-            self._secrets_cache[secret_name] = secret.value
-            return secret.value
-        except ResourceNotFoundError:
-            logger.warning(f"Secret '{secret_name}' not found in Key Vault")
-            return None
+            return self.client.get_secret(name).value
         except Exception as e:
-            logger.error(f"Error retrieving secret '{secret_name}': {e}")
+            self.logger.error(f"KeyVault: error retrieving '{name}': {e}")
             return None
     
     def get_all_secrets(self) -> Dict[str, str]:
