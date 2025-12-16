@@ -41,6 +41,7 @@ from PA.session_embedding_processor import SessionEmbeddingProcessor
 from PA.utils.config_utils import load_config
 from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
+from neo4j_env_utils import apply_neo4j_credentials
 
 
 class SessionEmbeddingStep:
@@ -60,13 +61,13 @@ class SessionEmbeddingStep:
         self.use_keyvault = use_keyvault
         self.logger = self._setup_logging()
         
-        # Load secrets from Key Vault if in Azure ML
-        if self.use_keyvault and self._is_azure_ml_environment():
-            self._load_secrets_from_keyvault()
-        
         self.config = self._load_configuration(config_path)
         # For embedding processor, incremental means create_only_new
         self.create_only_new = self.incremental
+
+        # Load secrets from Key Vault if in Azure ML
+        if self.use_keyvault and self._is_azure_ml_environment():
+            self._load_secrets_from_keyvault()
     
     def _is_azure_ml_environment(self) -> bool:
         """Check if running in Azure ML environment."""
@@ -84,6 +85,20 @@ class SessionEmbeddingStep:
         """Load secrets from Azure Key Vault."""
         try:
             self.logger.info("Loading secrets from Azure Key Vault")
+            existing_uri = os.environ.get("NEO4J_URI")
+            existing_user = os.environ.get("NEO4J_USERNAME")
+            existing_pwd = os.environ.get("NEO4J_PASSWORD")
+
+            if all([existing_uri, existing_user, existing_pwd]):
+                apply_neo4j_credentials(
+                    self.config,
+                    existing_uri,
+                    existing_user,
+                    existing_pwd,
+                    logger=self.logger,
+                )
+                self.logger.info("Neo4j credentials already available in environment; skipping Key Vault")
+                return
             
             # Get Key Vault name from environment or use default
             kv_name = os.environ.get("KEYVAULT_NAME", "strategicai-kv-uks-dev")
@@ -104,8 +119,16 @@ class SessionEmbeddingStep:
                     os.environ[key] = value
                     self.logger.info(f"Loaded {key} from Key Vault")
             
+            apply_neo4j_credentials(
+                self.config,
+                neo4j_secrets.get("NEO4J_URI"),
+                neo4j_secrets.get("NEO4J_USERNAME"),
+                neo4j_secrets.get("NEO4J_PASSWORD"),
+                logger=self.logger,
+            )
+
             self.logger.info("Successfully loaded all secrets from Key Vault")
-            
+
         except Exception as e:
             self.logger.warning(f"Could not load secrets from Key Vault: {e}")
             self.logger.info("Will fall back to environment variables or .env file")

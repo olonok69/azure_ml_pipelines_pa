@@ -50,6 +50,7 @@ from PA.session_recommendation_processor import SessionRecommendationProcessor
 from PA.utils.config_utils import load_config
 from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
+from neo4j_env_utils import apply_neo4j_credentials
 import mlflow
 from neo4j import GraphDatabase
 
@@ -114,6 +115,13 @@ class RecommendationsStep:
             neo4j_password = os.environ.get("NEO4J_PASSWORD")
             
             if all([neo4j_uri, neo4j_username, neo4j_password]):
+                apply_neo4j_credentials(
+                    self.config,
+                    neo4j_uri,
+                    neo4j_username,
+                    neo4j_password,
+                    logger=self.logger,
+                )
                 self.logger.info("Neo4j credentials found in environment variables")
                 return {
                     "NEO4J_URI": neo4j_uri,
@@ -138,6 +146,14 @@ class RecommendationsStep:
                 neo4j_password = os.environ.get("NEO4J_PASSWORD")
                 
                 if all([neo4j_uri, neo4j_username, neo4j_password]):
+                    apply_neo4j_credentials(
+                        self.config,
+                        neo4j_uri,
+                        neo4j_username,
+                        neo4j_password,
+                        logger=self.logger,
+                        env_path=env_path,
+                    )
                     return {
                         "NEO4J_URI": neo4j_uri,
                         "NEO4J_USERNAME": neo4j_username,

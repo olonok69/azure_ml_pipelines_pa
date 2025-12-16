@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
@@ -20,6 +20,27 @@ _ENVIRONMENT_KEY_MAP = {
 }
 
 
+def determine_environment_key(
+    env_value: Optional[str], logger: Optional[logging.Logger] = None
+) -> Tuple[str, str]:
+    """Return normalized environment name and suffix key used for env vars."""
+
+    requested_env = str(env_value or "prod").strip()
+    requested_env_lower = requested_env.lower()
+    resolved_key = _ENVIRONMENT_KEY_MAP.get(requested_env_lower)
+
+    if not resolved_key:
+        if logger:
+            logger.warning(
+                "Unknown Neo4j environment '%s'; defaulting to 'prod' settings",
+                requested_env,
+            )
+        requested_env_lower = "prod"
+        resolved_key = "PROD"
+
+    return requested_env_lower, resolved_key
+
+
 def resolve_neo4j_credentials(
     config: Optional[Dict[str, Any]] = None,
     logger: Optional[logging.Logger] = None,
@@ -28,18 +49,9 @@ def resolve_neo4j_credentials(
 
     config = config or {}
     neo4j_section = config.get("neo4j", {}) or {}
-    requested_env = str(neo4j_section.get("environment", "prod") or "prod").strip()
-    requested_env_lower = requested_env.lower()
-
-    resolved_key = _ENVIRONMENT_KEY_MAP.get(requested_env_lower)
-    if not resolved_key:
-        if logger:
-            logger.warning(
-                "Unknown Neo4j environment '%s'; defaulting to 'prod' settings",
-                requested_env,
-            )
-        resolved_key = "PROD"
-        requested_env_lower = "prod"
+    requested_env_lower, resolved_key = determine_environment_key(
+        neo4j_section.get("environment"), logger=logger
+    )
 
     uri = os.getenv(f"NEO4J_URI_{resolved_key}")
     password = os.getenv(f"NEO4J_PASSWORD_{resolved_key}")

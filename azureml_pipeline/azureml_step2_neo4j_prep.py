@@ -45,6 +45,7 @@ from PA.neo4j_visitor_relationship_processor import Neo4jVisitorRelationshipProc
 from PA.utils.config_utils import load_config
 from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
+from neo4j_env_utils import apply_neo4j_credentials
 
 
 class Neo4jPreparationStep:
@@ -64,11 +65,11 @@ class Neo4jPreparationStep:
         self.use_keyvault = use_keyvault
         self.logger = self._setup_logging()
         
+        self.config = self._load_configuration(config_path)
+
         # Load secrets from Key Vault if in Azure ML
         if self.use_keyvault and self._is_azure_ml_environment():
             self._load_secrets_from_keyvault()
-        
-        self.config = self._load_configuration(config_path)
         # IMPORTANT: For Neo4j processors, create_only_new=True means incremental mode
         # This is opposite of the incremental flag logic, so we use incremental directly
         self.create_only_new = self.incremental
@@ -93,6 +94,16 @@ class Neo4jPreparationStep:
             neo4j_username = os.environ.get("NEO4J_USERNAME")
             neo4j_password = os.environ.get("NEO4J_PASSWORD")
             
+            if all([neo4j_uri, neo4j_username, neo4j_password]):
+                apply_neo4j_credentials(
+                    self.config,
+                    neo4j_uri,
+                    neo4j_username,
+                    neo4j_password,
+                    logger=self.logger,
+                )
+                return
+
             if not all([neo4j_uri, neo4j_username, neo4j_password]):
                 # Try to get from Key Vault
                 try:
@@ -113,37 +124,13 @@ class Neo4jPreparationStep:
                 except Exception as kv_error:
                     self.logger.warning(f"Could not load from Key Vault: {kv_error}")
             
-            # Create or update .env file with available credentials
-            env_path = os.path.join(project_root, "PA", "keys", ".env")
-            os.makedirs(os.path.dirname(env_path), exist_ok=True)
-            
-            # Read existing .env file if it exists
-            existing_env = {}
-            if os.path.exists(env_path):
-                with open(env_path, 'r') as f:
-                    for line in f:
-                        if '=' in line and not line.startswith('#'):
-                            key, value = line.strip().split('=', 1)
-                            existing_env[key] = value
-            
-            # Update with Neo4j credentials from environment
-            if os.environ.get("NEO4J_URI"):
-                existing_env["NEO4J_URI"] = os.environ.get("NEO4J_URI")
-            if os.environ.get("NEO4J_USERNAME"):
-                existing_env["NEO4J_USERNAME"] = os.environ.get("NEO4J_USERNAME")
-            if os.environ.get("NEO4J_PASSWORD"):
-                existing_env["NEO4J_PASSWORD"] = os.environ.get("NEO4J_PASSWORD")
-            
-            # Write updated .env file
-            with open(env_path, 'w') as f:
-                f.write("# Neo4j credentials\n")
-                for key, value in existing_env.items():
-                    f.write(f"{key}={value}\n")
-            
-            self.logger.info(f"Updated .env file at {env_path}")
-            
-            # Ensure the file can be read by the PA processors
-            load_dotenv(env_path, override=True)
+            apply_neo4j_credentials(
+                self.config,
+                os.environ.get("NEO4J_URI"),
+                os.environ.get("NEO4J_USERNAME"),
+                os.environ.get("NEO4J_PASSWORD"),
+                logger=self.logger,
+            )
             
         except Exception as e:
             self.logger.error(f"Error in Key Vault setup: {e}")
