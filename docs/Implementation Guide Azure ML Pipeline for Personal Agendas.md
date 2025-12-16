@@ -37,18 +37,19 @@ project_root/
 │   ├── session_processor.py
 │   ├── config/
 │   │   ├── config_vet.yaml
+│   │   ├── config_vet_lva.yaml   # current target show
 │   │   └── config_ecomm.yaml
 │   └── utils/
 ├── azureml_pipeline/            # New Azure ML pipeline code
 │   ├── azureml_step1_data_prep.py
 │   ├── azureml_step2_neo4j_prep.py
-│   ├── azureml_step3_embeddings.py
+│   ├── azureml_step3_session_embedding.py
 │   ├── azureml_step4_recommendations.py
 │   └── pipeline_config.yaml
 ├── env/
 │   └── conda.yaml
 └── notebooks/
-    └── submit_pipeline.ipynb
+    └── submit_pipeline_complete.ipynb
 ```
 
 ## Implementation Steps
@@ -89,138 +90,89 @@ ml_client = MLClient(
     workspace="<your-workspace>"
 )
 
-# Create environment
+# Create or update the shared PA environment (CPU only)
 env = Environment(
-    name="personal_agendas_env",
-    description="Environment for Personal Agendas pipeline",
+    name="pa-env",
+    description="CPU environment for Personal Agendas pipeline",
     conda_file="./env/conda.yaml",
-    image="mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu20.04:latest"
+    image="mcr.microsoft.com/azureml/openmpi5.0-ubuntu24.04:20250601.v1"
 )
 ml_client.environments.create_or_update(env)
 ```
 
 ### Step 3: Create the Pipeline Submission Script
 
-Create a Jupyter notebook or Python script to submit the pipeline:
+Use `notebooks/submit_pipeline_complete.ipynb` (run from the `notebooks/` folder so it can reference the repo root). The notebook already wires all four Azure ML command components to the real scripts:
+
+- Step 1 → `azureml_step1_data_prep.py`
+- Step 2 → `azureml_step2_neo4j_prep.py`
+- Step 3 → `azureml_step3_session_embedding.py`
+- Step 4 → `azureml_step4_recommendations.py`
+
+Key settings for the current run:
+
+1. **Config selection** – set `pipeline_config_type="vet_lva"` so that every step receives `PA/config/config_vet_lva.yaml`.
+2. **Input data** – point `pipeline_input_data` at the `landing_pa` datastore path that contains the vetted landing files:
 
 ```python
-from azure.ai.ml import MLClient, command, Input, Output
-from azure.ai.ml.dsl import pipeline
-from azure.ai.ml.entities import Data
-from azure.ai.ml.constants import AssetTypes, InputOutputModes
-from azure.identity import DefaultAzureCredential
-import os
-
-# Initialize ML Client
-credential = DefaultAzureCredential()
-ml_client = MLClient(
-    credential,
-    subscription_id=os.getenv("SUBSCRIPTION_ID"),
-    resource_group=os.getenv("RESOURCE_GROUP"),
-    workspace=os.getenv("AZUREML_WORKSPACE_NAME")
+input_data_uri = (
+    f"azureml://subscriptions/{subscription_id}/resourcegroups/{resource_group}/"
+    f"workspaces/{workspace_name}/datastores/landing_pa/paths/landing/azureml/"
 )
 
-# Define Step 1: Data Preparation
-@command(
-    name="data_preparation",
-    display_name="Data Preparation (Registration, Scan, Session)",
-    environment="personal_agendas_env:latest",
-    compute="cpu-cluster",
-    code="./azureml_pipeline",
-    is_deterministic=False
+pipeline_job = personal_agendas_complete_pipeline(
+    pipeline_input_data=Input(type=AssetTypes.URI_FOLDER, path=input_data_uri),
+    pipeline_config_type="vet_lva",
+    pipeline_incremental="false"
 )
-def data_preparation_step(
-    input_uri: Input(type=AssetTypes.URI_FOLDER),
-    config_file: Input(type=AssetTypes.URI_FILE),
-    incremental: bool = False
-) -> dict:
-    return {
-        "registration_output": Output(type=AssetTypes.URI_FOLDER),
-        "scan_output": Output(type=AssetTypes.URI_FOLDER),
-        "session_output": Output(type=AssetTypes.URI_FOLDER),
-        "metadata_output": Output(type=AssetTypes.URI_FOLDER)
-    }
-
-# Define the pipeline
-@pipeline(
-    name="personal_agendas_pipeline",
-    description="Personal Agendas data processing pipeline"
-)
-def personal_agendas_pipeline(
-    input_data_uri: str,
-    config_type: str = "vet"  # or "ecomm"
-):
-    # Step 1: Data Preparation
-    step1 = data_preparation_step(
-        input_uri=input_data_uri,
-        config_file=f"./PA/config/config_{config_type}.yaml",
-        incremental=False
-    )
-    
-    # Additional steps would be added here
-    # step2 = neo4j_preparation_step(...)
-    # step3 = embeddings_step(...)
-    # step4 = recommendations_step(...)
-    
-    return {
-        "registration_data": step1.outputs.registration_output,
-        "scan_data": step1.outputs.scan_output,
-        "session_data": step1.outputs.session_output
-    }
-
-# Submit the pipeline
-pipeline_job = personal_agendas_pipeline(
-    input_data_uri="azureml://datastores/landing/paths/weekly_refresh_data",
-    config_type="vet"
-)
-
-# Submit to Azure ML
-submitted_job = ml_client.jobs.create_or_update(
-    pipeline_job,
-    experiment_name="personal_agendas_experiment"
-)
-
-print(f"Pipeline submitted: {submitted_job.name}")
-print(f"Monitor at: {submitted_job.studio_url}")
 ```
+
+3. **Compute / environment** – all four steps target the shared `cpu-cluster` and use the `pa-env` Azure ML environment, which matches the Standard_E4ds_v4 compute instance available in the workspace.
+4. **Secrets** – the notebook passes `KEYVAULT_NAME`, Neo4j credentials, and service-principal variables through `environment_variables` so each step can hydrate `PA/keys/.env` on the fly. Ensure those secrets exist in Key Vault before submission.
+
+Run the bottom cells of the notebook to submit, monitor, and log the pipeline run in Azure ML Studio.
 
 ### Step 4: Data Transfer Between Steps
 
-The pipeline uses Azure ML's Output objects to transfer data between steps:
+Azure ML automatically persists every step output in the workspace datastore. The pipeline relies on those managed folders to keep the run reproducible:
 
-1. **Step 1 outputs** are automatically saved to Azure Blob Storage
-2. **Step 2 inputs** reference Step 1's outputs using `source` parameter
-3. Azure ML handles the data transfer automatically
+1. Step 1 writes three hand-off folders (`registration_output`, `scan_output`, `session_output`) plus a `metadata_output` manifest. All downstream steps stay dependent on these folders so we can rehydrate Neo4j from the same artifacts.
+2. Step 2 consumes the three folders, recreates the PA `data/<event>/output` structure, loads Neo4j, and publishes a single `metadata_output` folder that records processor statistics. Step 3 is configured to depend on that metadata output to enforce ordering even though embeddings read directly from Neo4j.
+3. Step 3 emits another `metadata_output` folder so that Step 4 will not start until embeddings have completed for the target show.
 
-Example for Step 2 input configuration:
-```python
-step2_inputs = {
-    "registration_data": step1.outputs.registration_output,
-    "scan_data": step1.outputs.scan_output,
-    "session_data": step1.outputs.session_output
-}
-```
+The actual folder names map 1:1 to the component outputs inside `submit_pipeline_complete.ipynb` and to the `steps` definitions in `azureml_pipeline/pipeline_config.yaml`.
+
+## Step Contracts (Inputs / Outputs)
+
+| Step | Inputs | Outputs | Notes |
+| --- | --- | --- | --- |
+| Step 1 – Data Preparation | `pipeline_input_data` (landing_pa folder mounted read-only), `PA/config/config_<event>.yaml`, `incremental` flag | `registration_output`, `scan_output`, `session_output`, `metadata_output` (each an Azure ML folder) | The script copies curated CSV/JSON artifacts into the output folders with canonical names that remain stable across shows. `metadata_output` contains processor logs and run stats. |
+| Step 2 – Neo4j Preparation | Step 1 registration/scan/session outputs, same config file, `incremental` flag | `metadata_output` | Copies Step 1 artifacts back into `data/<event>/output`, loads Neo4j, and records processor statistics. No graph export is produced yet, so replays depend on the Step 1 folders. |
+| Step 3 – Session Embedding | Config file, `incremental` flag, implicit dependency on Step 2 metadata | `metadata_output` | Reads session/state directly from Neo4j. The output folder contains embedding summaries plus a completion marker so Step 4 only runs after embeddings finish. |
+| Step 4 – Recommendations | Config file, `incremental` flag, implicit dependency on Step 3 metadata | `metadata_output` (includes copied JSON/CSV recommendation files) | The processor drops recommendation exports under `data/output/recommendations` and the step copies the latest files into the Azure ML output so they can be downloaded from the pipeline job. |
+
+Use this table as the contract when validating new shows—if a step is re-run manually, ensure the expected input folders exist (from either the previous step or from an earlier pipeline run) before starting Azure ML.
 
 ### Step 5: Configuration Management
 
 The pipeline configuration is managed through:
 
-1. **YAML config files** (config_vet.yaml, config_ecomm.yaml) - unchanged from PA
+1. **YAML config files** (`config_vet.yaml`, `config_vet_lva.yaml`, `config_ecomm.yaml`) - unchanged from PA
 2. **Pipeline parameters** - passed via Azure ML pipeline
 3. **Environment variables** - for Azure credentials
 
 To switch between VET and ECOMM configurations:
 ```python
-# For VET events
-pipeline_job = personal_agendas_pipeline(
-    input_data_uri="...",
-    config_type="vet"
+# For Vet LVA (current run)
+pipeline_job = personal_agendas_complete_pipeline(
+   pipeline_input_data=<landing_pa path>,
+   pipeline_config_type="vet_lva"
 )
 
-# For ECOMM events  
-pipeline_job = personal_agendas_pipeline(
-    input_data_uri="...",
-    config_type="ecomm"
+# For other events adjust only the config selector
+pipeline_job = personal_agendas_complete_pipeline(
+   pipeline_input_data=<landing_pa path>,
+   pipeline_config_type="vet"  # or "ecomm"
 )
 ```
 
@@ -297,8 +249,8 @@ python azureml_pipeline/azureml_step1_data_prep.py \
    - Uses outputs from Step 1
 
 2. **Implement Step 3** (Session Embeddings):
-   - Requires GPU compute
-   - Separate environment with ML libraries
+   - Runs today on CPU `pa-env` / `cpu-cluster`
+   - If a GPU SKU becomes available later, only the component compute target needs to change
 
 3. **Implement Step 4** (Recommendations):
    - Final output generation

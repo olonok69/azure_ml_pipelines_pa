@@ -5,6 +5,7 @@ pipeline:
   name: "personal_agendas_pipeline"
   description: "Multi-step pipeline for Personal Agendas data processing"
   version: "1.0.0"
+  default_event_type: "vet_lva"
   
 # Azure ML Workspace Configuration
 azure_ml:
@@ -24,14 +25,14 @@ steps:
     enabled: true
     script: "azureml_step1_data_prep.py"
     compute: "cpu-cluster"
-    environment: "personal_agendas_env"
+    environment: "pa-env"
     inputs:
       input_data:
         type: "uri_folder"
-        path: "azureml://datastores/landing/paths/weekly_refresh_data"
+        path: "azureml://datastores/landing_pa/paths/landing/azureml/"
       config_file:
         type: "uri_file"
-        path: "./config/config_${EVENT_TYPE}.yaml"
+        path: "PA/config/config_${EVENT_TYPE}.yaml"
     outputs:
       registration_output:
         type: "uri_folder"
@@ -54,7 +55,7 @@ steps:
     enabled: true
     script: "azureml_step2_neo4j_prep.py"
     compute: "cpu-cluster"
-    environment: "personal_agendas_env"
+    environment: "pa-env"
     inputs:
       registration_data:
         type: "uri_folder"
@@ -67,12 +68,9 @@ steps:
         source: "data_preparation.outputs.session_output"
       config_file:
         type: "uri_file"
-        path: "./config/config_${EVENT_TYPE}.yaml"
+        path: "PA/config/config_${EVENT_TYPE}.yaml"
     outputs:
-      neo4j_data:
-        type: "uri_folder"
-        mode: "rw_mount"
-      relationships:
+      metadata_output:
         type: "uri_folder"
         mode: "rw_mount"
     parameters:
@@ -81,21 +79,17 @@ steps:
   # Step 3: Session Embeddings
   session_embeddings:
     enabled: true
-    script: "azureml_step3_embeddings.py"
-    compute: "gpu-cluster"  # Use GPU for embeddings
-    environment: "personal_agendas_gpu_env"
+    script: "azureml_step3_session_embedding.py"
+    compute: "cpu-cluster"
+    environment: "pa-env"
+    depends_on:
+      - "neo4j_preparation"
     inputs:
-      neo4j_data:
-        type: "uri_folder"
-        source: "neo4j_preparation.outputs.neo4j_data"
-      session_data:
-        type: "uri_folder"
-        source: "data_preparation.outputs.session_output"
       config_file:
         type: "uri_file"
-        path: "./config/config_${EVENT_TYPE}.yaml"
+        path: "PA/config/config_${EVENT_TYPE}.yaml"
     outputs:
-      embeddings:
+      metadata_output:
         type: "uri_folder"
         mode: "rw_mount"
     parameters:
@@ -107,22 +101,15 @@ steps:
     enabled: true
     script: "azureml_step4_recommendations.py"
     compute: "cpu-cluster"
-    environment: "personal_agendas_env"
+    environment: "pa-env"
+    depends_on:
+      - "session_embeddings"
     inputs:
-      neo4j_data:
-        type: "uri_folder"
-        source: "neo4j_preparation.outputs.neo4j_data"
-      embeddings:
-        type: "uri_folder"
-        source: "session_embeddings.outputs.embeddings"
       config_file:
         type: "uri_file"
-        path: "./config/config_${EVENT_TYPE}.yaml"
+        path: "PA/config/config_${EVENT_TYPE}.yaml"
     outputs:
-      recommendations:
-        type: "uri_folder"
-        mode: "rw_mount"
-      metrics:
+      metadata_output:
         type: "uri_folder"
         mode: "rw_mount"
     parameters:
@@ -131,9 +118,9 @@ steps:
 
 # Data Configuration
 data:
-  input_datastore: "landing"
-  output_datastore: "processed"
-  intermediate_datastore: "intermediate"
+  input_datastore: "landing_pa"
+  output_datastore: "landing_pa"
+  intermediate_datastore: "landing_pa"
   
 # Monitoring and Logging
 monitoring:
