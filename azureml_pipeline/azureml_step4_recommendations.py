@@ -696,6 +696,19 @@ def main(args):
     return 0 if status == 'success' else 1
 
 
+def _bool_arg(value: Optional[str]) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    value_str = str(value).strip().lower()
+    if value_str in {"true", "1", "yes", "y"}:
+        return True
+    if value_str in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected for incremental flag")
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Azure ML Recommendations Step")
@@ -709,8 +722,11 @@ def parse_args():
     
     parser.add_argument(
         "--incremental",
-        action="store_true",
-        help="Run incremental processing (only create new recommendations)"
+        nargs="?",
+        const=True,
+        default=False,
+        type=_bool_arg,
+        help="Run incremental processing (accepts true/false)"
     )
     
     parser.add_argument(

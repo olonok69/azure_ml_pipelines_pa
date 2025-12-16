@@ -4,7 +4,7 @@ import string
 import logging
 import pandas as pd
 import functools
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 from datetime import datetime
 from pandas import json_normalize
 from fuzzywuzzy import process
@@ -72,6 +72,13 @@ class RegistrationProcessor:
             config: Dictionary containing configuration parameters
         """
         self.config = config
+        self.mode = (config.get("mode") or "personal_agendas").lower()
+        self.is_engagement_mode = self.mode == "engagement"
+        self.engagement_config = config.get("engagement_mode", {}) or {}
+        self._engagement_reset_returning_flags = False
+        self._engagement_drop_last_year_when_missing = False
+
+        self.old_format = config.get("old_format", True)
         self.output_dir = config.get("output_dir", "output")
         
         # Get event configuration
@@ -83,14 +90,18 @@ class RegistrationProcessor:
         
         # Handle shows_this_year - flatten if it's a list of lists (for ecomm)
         shows_this_year_raw = self.event_config.get("shows_this_year", [])
-        self.shows_this_year = self._flatten_show_list(shows_this_year_raw)
+        self.shows_this_year = self._normalize_show_codes(shows_this_year_raw)
         
         # Handle shows_this_year_exclude - flatten if it's a list of lists (for ecomm)
         shows_this_year_exclude_raw = self.event_config.get("shows_this_year_exclude", [])
-        self.shows_this_year_exclude = self._flatten_show_list(shows_this_year_exclude_raw)
+        self.shows_this_year_exclude = self._normalize_show_codes(shows_this_year_exclude_raw)
         
-        self.shows_last_year_main = self.event_config.get("shows_last_year_main", [])
-        self.shows_last_year_secondary = self.event_config.get("shows_last_year_secondary", [])
+        self.shows_last_year_main = self._normalize_show_codes(
+            self.event_config.get("shows_last_year_main", [])
+        )
+        self.shows_last_year_secondary = self._normalize_show_codes(
+            self.event_config.get("shows_last_year_secondary", [])
+        )
 
         # Get output file configurations with backward compatibility
         self.output_files = config.get("output_files", {})
@@ -123,8 +134,11 @@ class RegistrationProcessor:
         # Use existing logger instead of configuring a new one
         self.logger = logging.getLogger(__name__)
         self.logger.info(
-            f"Initialized RegistrationProcessor for {self.main_event_name} event with output to {self.output_dir}"
+            f"Initialized RegistrationProcessor for {self.main_event_name} event with output to {self.output_dir} (old_format={self.old_format}, mode={self.mode})"
         )
+
+        # Apply engagement-mode overrides after logger is available so we can emit diagnostics
+        self._apply_engagement_overrides()
 
     def _flatten_show_list(self, show_list: List) -> List[str]:
         """
@@ -149,6 +163,311 @@ class RegistrationProcessor:
                 flattened.append(item)
         
         return flattened
+
+    def _normalize_show_codes(self, show_list: List) -> List[str]:
+        """Flatten and normalize show reference codes to uppercase strings."""
+        normalized: List[str] = []
+        for item in self._flatten_show_list(show_list):
+            if isinstance(item, str):
+                value = item.strip().upper()
+                if value:
+                    normalized.append(value)
+        return normalized
+
+    def _apply_engagement_overrides(self) -> None:
+        """Apply engagement-mode specific overrides for show selection and flags."""
+        if not self.is_engagement_mode:
+            return
+
+        self.logger.info("Engagement mode active: applying registration show overrides")
+
+        reg_shows_cfg = self.engagement_config.get("registration_shows", {}) or {}
+
+        def _override_list(description: str, current: List[str], key: str) -> List[str]:
+            if key not in reg_shows_cfg:
+                return current
+            new_value = self._normalize_show_codes(reg_shows_cfg.get(key, []))
+            if new_value != current:
+                self.logger.info(
+                    "Engagement mode: overriding %s from %s to %s",
+                    description,
+                    current,
+                    new_value,
+                )
+            else:
+                self.logger.info("Engagement mode: %s remains %s", description, current)
+            return new_value
+
+        self.shows_this_year = _override_list(
+            "current-year main show references",
+            self.shows_this_year,
+            "this_year_main",
+        )
+        self.shows_this_year_exclude = _override_list(
+            "current-year secondary show references",
+            self.shows_this_year_exclude,
+            "this_year_secondary",
+        )
+
+        if "last_year_main" in reg_shows_cfg:
+            new_last_year_main = self._normalize_show_codes(reg_shows_cfg.get("last_year_main", []))
+            self.logger.info(
+                "Engagement mode: overriding past-year main show references from %s to %s",
+                self.shows_last_year_main,
+                new_last_year_main,
+            )
+            self.shows_last_year_main = new_last_year_main
+
+        if "last_year_secondary" in reg_shows_cfg:
+            new_last_year_secondary = self._normalize_show_codes(reg_shows_cfg.get("last_year_secondary", []))
+            self.logger.info(
+                "Engagement mode: overriding past-year secondary show references from %s to %s",
+                self.shows_last_year_secondary,
+                new_last_year_secondary,
+            )
+            self.shows_last_year_secondary = new_last_year_secondary
+
+        # Control how we handle missing past-year data and returning visitor flags
+        self._engagement_drop_last_year_when_missing = bool(
+            reg_shows_cfg.get("drop_last_year_when_missing", True)
+        )
+        self._engagement_reset_returning_flags = bool(
+            self.engagement_config.get("reset_returning_flags", True)
+        )
+
+        self.logger.info(
+            "Engagement mode configuration -> this_year: %s | secondary: %s | last_year: %s | last_year_secondary: %s",
+            self.shows_this_year,
+            self.shows_this_year_exclude,
+            self.shows_last_year_main,
+            self.shows_last_year_secondary,
+        )
+
+        if not self.shows_this_year:
+            self.logger.warning(
+                "Engagement mode: no show references configured for the current-year dataset; downstream outputs will be empty"
+            )
+
+    def _infer_show_ref_from_filename(
+        self, file_path: str, fallback: Optional[str] = None
+    ) -> Optional[str]:
+        """Infer a show reference code from a file name."""
+        if not file_path:
+            return fallback
+
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        # Look for segments that contain letters followed by digits (e.g. CPCN25)
+        candidates = re.findall(r"[A-Za-z]{2,}\d{2,}", base_name)
+        if candidates:
+            return candidates[-1].upper()
+        return fallback
+
+    @staticmethod
+    def _extract_show_from_source(source_value: Optional[str]) -> Optional[str]:
+        """Derive a show reference from a source string (e.g. CPCN25_Com -> CPCN25)."""
+        if not isinstance(source_value, str):
+            return None
+
+        cleaned = source_value.strip()
+        if not cleaned:
+            return None
+
+        matches = re.findall(r"[A-Za-z]{2,}\d{2,}", cleaned)
+        if matches:
+            return matches[0].upper()
+
+        if "_" in cleaned:
+            prefix = cleaned.split("_")[0]
+            matches = re.findall(r"[A-Za-z]{2,}\d{2,}", prefix)
+            if matches:
+                return matches[0].upper()
+
+        return None
+
+    @staticmethod
+    def _normalize_attended_value(value):
+        """Normalize attended values to Yes/No strings."""
+        if pd.isna(value):
+            return value
+
+        str_val = str(value).strip().lower()
+        if str_val in {"1", "true", "yes", "y"}:
+            return "Yes"
+        if str_val in {"0", "false", "no", "n"}:
+            return "No"
+        return str(value)
+
+    def _standardize_registration_dataframe(
+        self, df: pd.DataFrame, default_show_ref: Optional[str] = None
+    ) -> pd.DataFrame:
+        """Map GraphQL registration schemas to the legacy schema expected downstream."""
+        if df.empty:
+            if default_show_ref is not None and "ShowRef" not in df.columns:
+                df["ShowRef"] = pd.Series(dtype=object)
+            return df
+
+        rename_map = {
+            "id": "Id",
+            "title": "Title",
+            "forename": "Forename",
+            "surname": "Surname",
+            "email": "Email",
+            "tel": "Tel",
+            "mobile": "Mobile",
+            "fax": "Fax",
+            "company": "Company",
+            "job_title": "JobTitle",
+            "addr1": "Addr1",
+            "addr2": "Addr2",
+            "addr3": "Addr3",
+            "town": "Town",
+            "county": "County",
+            "postcode": "Postcode",
+            "country": "Country",
+            "status": "Status",
+            "badge_type": "BadgeType",
+            "registration_date": "RegistrationDate",
+            "badge_id": "BadgeId",
+            "reg_code": "RegCode",
+            "source": "Source",
+            "attended": "Attended",
+            "segment_from_reg": "SegmentFromReg",
+            "upgrade": "Upgrade",
+            "metadata_source_filename": "METADATA_fileName",
+            "metadata_provider_source": "METADATA_provider_source",
+            "metadata_show_date": "METADATA_show_date",
+            "metadata_record_start_date": "METADATA_record_start_date",
+            "metadata_record_end_date": "METADATA_record_end_date",
+            "show_ref": "ShowRef",
+        }
+
+        columns_to_rename = {
+            original: new_name
+            for original, new_name in rename_map.items()
+            if original in df.columns
+        }
+        if columns_to_rename:
+            df = df.rename(columns=columns_to_rename)
+
+        # Ensure ShowRef column is populated
+        show_series = (
+            df["ShowRef"].copy()
+            if "ShowRef" in df.columns
+            else pd.Series([None] * len(df), index=df.index)
+        )
+        show_series = show_series.apply(
+            lambda x: str(x).strip().upper() if isinstance(x, str) and x.strip() else None
+        )
+
+        if "Source" in df.columns:
+            derived_from_source = df["Source"].apply(self._extract_show_from_source)
+            show_series = show_series.fillna(derived_from_source)
+
+        valid_show_codes: Set[str] = set()
+        for show_list in (
+            self.shows_this_year,
+            self.shows_this_year_exclude,
+            self.shows_last_year_main,
+            self.shows_last_year_secondary,
+        ):
+            valid_show_codes.update({code.upper() for code in show_list})
+
+        if default_show_ref:
+            valid_show_codes.add(default_show_ref.upper())
+
+        if valid_show_codes:
+            show_series = show_series.apply(
+                lambda val: val if isinstance(val, str) and val in valid_show_codes else None
+            )
+
+        if default_show_ref:
+            show_series = show_series.fillna(default_show_ref)
+
+        df["ShowRef"] = show_series.fillna("UNKNOWN").astype(str).str.upper()
+
+        # Normalize Attended values and important text fields
+        if "Attended" in df.columns:
+            df["Attended"] = df["Attended"].apply(self._normalize_attended_value)
+
+        for text_col in [
+            "Email",
+            "Forename",
+            "Surname",
+            "JobTitle",
+            "RegistrationDate",
+            "BadgeId",
+            "Source",
+        ]:
+            if text_col in df.columns:
+                df[text_col] = df[text_col].astype(str).str.strip()
+
+        for numeric_contact_col in ["Tel", "Mobile", "Fax"]:
+            if numeric_contact_col in df.columns:
+                df[numeric_contact_col] = df[numeric_contact_col].apply(
+                    lambda x: str(int(x))
+                    if isinstance(x, float) and not pd.isna(x) and float(x).is_integer()
+                    else (str(x) if isinstance(x, (int, float)) and not pd.isna(x) else x)
+                )
+
+        # Ensure downstream optional columns exist
+        for optional_col in ["SegmentFromReg", "Upgrade"]:
+            if optional_col not in df.columns:
+                df[optional_col] = None
+
+        return df
+
+    def _standardize_demographic_dataframe(
+        self, df: pd.DataFrame, default_show_ref: Optional[str] = None
+    ) -> pd.DataFrame:
+        """Map GraphQL demographic schemas to the legacy schema expected downstream."""
+        if df.empty:
+            if default_show_ref is not None and "showref" not in df.columns:
+                df["showref"] = pd.Series(dtype=object)
+            return df
+
+        rename_map = {
+            "badge_id": "BadgeId",
+            "question_text": "QuestionText",
+            "answer_text": "AnswerText",
+            "metadata_source_filename": "METADATA_fileName",
+            "show_ref": "showref",
+        }
+
+        columns_to_rename = {
+            original: new_name
+            for original, new_name in rename_map.items()
+            if original in df.columns
+        }
+        if columns_to_rename:
+            df = df.rename(columns=columns_to_rename)
+
+        show_series = (
+            df["showref"].copy()
+            if "showref" in df.columns
+            else pd.Series([None] * len(df), index=df.index)
+        )
+        show_series = show_series.apply(
+            lambda x: str(x).strip().upper() if isinstance(x, str) and x.strip() else None
+        )
+
+        if "ShowRef" in df.columns:
+            show_series = show_series.fillna(
+                df["ShowRef"].apply(
+                    lambda x: str(x).strip().upper() if isinstance(x, str) and x.strip() else None
+                )
+            )
+            df = df.drop(columns=["ShowRef"])
+
+        if default_show_ref:
+            show_series = show_series.fillna(default_show_ref)
+
+        df["showref"] = show_series.fillna("UNKNOWN").astype(str).str.upper()
+
+        for col in ["QuestionText", "AnswerText", "BadgeId"]:
+            if col in df.columns:
+                df[col] = df[col].fillna("").astype(str)
+
+        return df
 
     def load_data(self) -> None:
         """Load all registration data files based on configuration."""
@@ -175,6 +494,41 @@ class RegistrationProcessor:
         self.df_lvs = pd.json_normalize(self.secondary_event_reg_data)  # Keep old naming for compatibility
         self.df_bva_demo = pd.json_normalize(self.main_event_demo_data)  # Keep old naming for compatibility
         self.df_lvs_demo = pd.json_normalize(self.secondary_event_demo_data)  # Keep old naming for compatibility
+
+        if not self.old_format:
+            self.logger.info("Detected new registration format; mapping to legacy schema")
+
+            main_reg_show = self._infer_show_ref_from_filename(
+                main_event_reg_file, (self.shows_this_year[0] if self.shows_this_year else None)
+            )
+            secondary_reg_show = self._infer_show_ref_from_filename(
+                secondary_event_reg_file,
+                (
+                    self.shows_last_year_secondary[0]
+                    if self.shows_last_year_secondary
+                    else (self.shows_this_year_exclude[0] if self.shows_this_year_exclude else None)
+                ),
+            )
+
+            main_demo_show = self._infer_show_ref_from_filename(
+                main_event_demo_file, main_reg_show
+            )
+            secondary_demo_show = self._infer_show_ref_from_filename(
+                secondary_event_demo_file, secondary_reg_show
+            )
+
+            self.df_bva = self._standardize_registration_dataframe(
+                self.df_bva, main_reg_show
+            )
+            self.df_lvs = self._standardize_registration_dataframe(
+                self.df_lvs, secondary_reg_show
+            )
+            self.df_bva_demo = self._standardize_demographic_dataframe(
+                self.df_bva_demo, main_demo_show
+            )
+            self.df_lvs_demo = self._standardize_demographic_dataframe(
+                self.df_lvs_demo, secondary_demo_show
+            )
 
         self.logger.info(
             f"Loaded {len(self.df_bva)} {self.main_event_name} registration records and {len(self.df_lvs)} {self.secondary_event_name} registration records"
@@ -329,13 +683,18 @@ class RegistrationProcessor:
         # Create a copy of the DataFrame to avoid SettingWithCopyWarning
         df_copy = df.copy()
 
+        # Handle empty DataFrames early so downstream logic still gets the column
+        if df_copy.empty:
+            return df_copy.assign(
+                Days_since_registration=pd.Series(dtype="int64")
+            )
+
         # Check if date_column exists in the DataFrame
         if date_column not in df_copy.columns:
             logger.warning(
                 f"Date column '{date_column}' not found in DataFrame. Adding dummy values."
             )
-            df_copy.loc[:, "Days_since_registration"] = 0
-            return df_copy
+            return df_copy.assign(Days_since_registration=0)
 
         # Convert the given date to datetime
         given_date = datetime.strptime(given_date_str, "%Y-%m-%d")
@@ -348,30 +707,41 @@ class RegistrationProcessor:
                 logger.warning(
                     f"No valid dates found in '{date_column}'. Adding dummy values."
                 )
-                df_copy.loc[:, "Days_since_registration"] = 0
-                return df_copy
+                return df_copy.assign(Days_since_registration=0)
 
             # Initialize Days_since_registration column with default value
-            df_copy.loc[:, "Days_since_registration"] = 0
+            df_copy = df_copy.assign(Days_since_registration=0)
 
-            # For each row with a non-null date, calculate days difference
-            for idx in df_copy[mask].index:
-                try:
-                    date_val = df_copy.loc[idx, date_column]
-                    # Make sure we have a proper datetime object
-                    if not isinstance(date_val, datetime):
-                        date_val = pd.to_datetime(date_val, errors="coerce")
+            # Vectorised calculation for rows with valid dates
+            converted_dates = pd.to_datetime(
+                df_copy.loc[mask, date_column], errors="coerce"
+            )
+            valid_dates_mask = converted_dates.notna()
 
-                    if pd.notna(date_val):
-                        # Calculate days difference directly without using .dt accessor
-                        days_diff = (given_date - date_val).days
-                        df_copy.loc[idx, "Days_since_registration"] = days_diff
-                except Exception as e:
-                    logger.warning(f"Error processing date for row {idx}: {e}")
+            if valid_dates_mask.any():
+                valid_index = converted_dates.index[valid_dates_mask]
+                days_diff_series = (
+                    given_date - converted_dates[valid_dates_mask]
+                ).dt.days
+                df_copy.loc[valid_index, "Days_since_registration"] = (
+                    days_diff_series.to_numpy()
+                )
+            else:
+                logger.warning(
+                    f"No valid dates found in '{date_column}' after conversion."
+                )
 
         except Exception as e:
             logger.error(f"Error calculating date difference: {e}", exc_info=True)
             # Keep default values to continue processing
+
+        # Ensure the column always exists, even if assign was skipped due to an error
+        if "Days_since_registration" not in df_copy.columns:
+            df_copy = df_copy.assign(Days_since_registration=0)
+        else:
+            df_copy.loc[:, "Days_since_registration"] = pd.to_numeric(
+                df_copy["Days_since_registration"], errors="coerce"
+            ).fillna(0).astype(int)
 
         return df_copy
 
@@ -434,42 +804,77 @@ class RegistrationProcessor:
 
         # Split registration data by year
         # Use the flattened shows_this_year list
-        self.df_bva_this_year = self.df_bva[self.df_bva.ShowRef.isin(self.shows_this_year)]
-        
-        # For last year, exclude both this year's shows AND the exclude list
+        self.df_bva_this_year = self.df_bva[
+            self.df_bva.ShowRef.isin(self.shows_this_year)
+        ].copy()
+
+        # Determine last-year datasets with optional engagement overrides
         all_shows_to_exclude = self.shows_this_year + self.shows_this_year_exclude
-        self.df_bva_last_year = self.df_bva[~self.df_bva.ShowRef.isin(all_shows_to_exclude)]
+
+        if self.shows_last_year_main:
+            self.df_bva_last_year = self.df_bva[
+                self.df_bva.ShowRef.isin(self.shows_last_year_main)
+            ].copy()
+        elif self.is_engagement_mode and self._engagement_drop_last_year_when_missing:
+            self.logger.info(
+                "Engagement mode: no explicit past-year main shows configured; skipping past-year main dataset"
+            )
+            self.df_bva_last_year = self.df_bva.iloc[0:0].copy()
+        else:
+            self.df_bva_last_year = self.df_bva[
+                ~self.df_bva.ShowRef.isin(all_shows_to_exclude)
+            ].copy()
 
         # Split demographic data by year
         self.df_bva_demo_this_year = self.df_bva_demo[
             self.df_bva_demo.showref.isin(self.shows_this_year)
-        ]
-        self.df_bva_demo_last_year = self.df_bva_demo[
-            ~self.df_bva_demo.showref.isin(all_shows_to_exclude)
-        ]
+        ].copy()
+        if self.shows_last_year_main:
+            self.df_bva_demo_last_year = self.df_bva_demo[
+                self.df_bva_demo.showref.isin(self.shows_last_year_main)
+            ].copy()
+        elif self.is_engagement_mode and self._engagement_drop_last_year_when_missing:
+            self.df_bva_demo_last_year = self.df_bva_demo.iloc[0:0].copy()
+        else:
+            self.df_bva_demo_last_year = self.df_bva_demo[
+                ~self.df_bva_demo.showref.isin(all_shows_to_exclude)
+            ].copy()
 
         # Process secondary event data
         # For ecomm: df_lvs_last_year should contain shows from shows_this_year_exclude (like TFM24)
         # For vet: df_lvs_last_year should contain shows from shows_last_year_secondary (like LVS2024)
-        if self.shows_this_year_exclude:
-            # For ecomm: get records from the exclude list (e.g., TFM24)
-            self.df_lvs_last_year = self.df_lvs[
+        if self.shows_last_year_secondary:
+            df_lvs_candidates = self.df_lvs[
+                self.df_lvs.ShowRef.isin(self.shows_last_year_secondary)
+            ].copy()
+            df_lvs_demo_candidates = self.df_lvs_demo[
+                self.df_lvs_demo.showref.isin(self.shows_last_year_secondary)
+            ].copy()
+        elif self.shows_this_year_exclude:
+            df_lvs_candidates = self.df_lvs[
                 self.df_lvs.ShowRef.isin(self.shows_this_year_exclude)
-            ]
-            # Filter by valid badge types
-            self.df_lvs_last_year = self.df_lvs_last_year[
-                self.df_lvs_last_year["BadgeType"].isin(valid_badge_types)
-            ]
-            
-            # Also update the demographic data for secondary event
-            self.df_lvs_demo = self.df_lvs_demo[
+            ].copy()
+            df_lvs_demo_candidates = self.df_lvs_demo[
                 self.df_lvs_demo.showref.isin(self.shows_this_year_exclude)
+            ].copy()
+        elif self.is_engagement_mode and self._engagement_drop_last_year_when_missing:
+            self.logger.info(
+                "Engagement mode: no explicit past-year secondary shows configured; skipping past-year secondary dataset"
+            )
+            df_lvs_candidates = self.df_lvs.iloc[0:0].copy()
+            df_lvs_demo_candidates = self.df_lvs_demo.iloc[0:0].copy()
+        else:
+            df_lvs_candidates = self.df_lvs.copy()
+            df_lvs_demo_candidates = self.df_lvs_demo.copy()
+
+        if not df_lvs_candidates.empty and "BadgeType" in df_lvs_candidates.columns:
+            self.df_lvs_last_year = df_lvs_candidates[
+                df_lvs_candidates["BadgeType"].isin(valid_badge_types)
             ]
         else:
-            # For vet: use the existing logic with valid badge types only
-            self.df_lvs_last_year = self.df_lvs[
-                self.df_lvs["BadgeType"].isin(valid_badge_types)
-            ]
+            self.df_lvs_last_year = df_lvs_candidates
+
+        self.df_lvs_demo = df_lvs_demo_candidates
 
         self.logger.info(
             f"Split {self.main_event_name} data: {len(self.df_bva_this_year)} records for this year, {len(self.df_bva_last_year)} records for last year"
@@ -506,8 +911,14 @@ class RegistrationProcessor:
         for df_name in ["df_bva_this_year", "df_bva_last_year", "df_lvs_last_year"]:
             df = getattr(self, df_name)
             df_copy = df.copy()
-            df_copy.loc[:, "id_both_years"] = df.apply(self.create_unique_id, axis=1)
-            df_copy.loc[:, "Email_domain"] = df["Email"].apply(
+            df_copy.loc[:, "id_both_years"] = (
+                df_copy["Forename"].astype(str).str.lower().str.strip()
+                + "_"
+                + df_copy["Surname"].astype(str).str.lower().str.strip()
+                + "_"
+                + df_copy["Email"].astype(str).str.lower().str.strip()
+            )
+            df_copy.loc[:, "Email_domain"] = df_copy["Email"].apply(
                 self.extract_email_domain
             )
             setattr(self, df_name, df_copy)
@@ -604,9 +1015,21 @@ class RegistrationProcessor:
         self.df_bva_this_year = self.flag_returning_visitors(
             self.df_bva_this_year, self.all_returning_visitors
         )
+        returning_count = int(self.df_bva_this_year["assist_year_before"].sum())
+        total_visitors = len(self.df_bva_this_year)
         self.logger.info(
-            f"Returning visitors: {self.df_bva_this_year['assist_year_before'].sum()} out of {len(self.df_bva_this_year)}"
+            "Returning visitors: %s out of %s",
+            returning_count,
+            total_visitors,
         )
+
+        if self.is_engagement_mode and self._engagement_reset_returning_flags:
+            if returning_count:
+                self.logger.info(
+                    "Engagement mode: overriding %s returning visitor flags to 0",
+                    returning_count,
+                )
+            self.df_bva_this_year.loc[:, "assist_year_before"] = 0
 
     def select_and_save_final_data(self) -> None:
         """Select relevant columns and save final processed data."""
@@ -1050,9 +1473,10 @@ class RegistrationProcessor:
                 answer = row.get("AnswerText")
 
                 if not question or not answer:
-                    logging.warning(
-                        f"Issue with records ID {badge_ID} NO ANSWER/QUESTION in demographic data"
-                    )
+                    # remove this line to avoid excessive logging
+                    # logging.warning(
+                    #     f"Issue with records ID {badge_ID} NO ANSWER/QUESTION in demographic data"
+                    # )
                     continue
                 if question in list_keep:
                     qq = question.lower().replace(" ", "_")
@@ -1195,30 +1619,173 @@ class RegistrationProcessor:
         self.logger.warning("process_job_roles called for vet event but vet-specific functions not properly applied")
         return df
 
-    # Replace the fill_missing_practice_types method in registration_processor.py:
-
     def fill_missing_practice_types(self, df, practices, column):
-        """
-        Fill missing practice types using fuzzy matching with company names.
-        This is ONLY for veterinary events. Generic events skip this entirely.
+        """Fill missing practice types using configured practices mapping.
 
-        Args:
-            df: DataFrame with potentially missing practice types
-            practices: DataFrame with company names and practice types
-            column: Name of the column containing practice types
-
-        Returns:
-            DataFrame (unchanged for generic events)
+        This implementation is only active for veterinary events. Generic events
+        return the dataframe unchanged.
         """
-        # Check if this is a veterinary event with vet-specific functions
-        if not (hasattr(self, '_vet_specific_active') and self._vet_specific_active):
-            # For generic events (like ECOMM), skip practice type filling entirely
-            self.logger.info("Skipping practice type filling for generic event (not a veterinary event)")
+
+        # Only execute for veterinary events (the vet-specific mixin sets this flag)
+        if not (hasattr(self, "_vet_specific_active") and self._vet_specific_active):
+            self.logger.info(
+                "Skipping practice type filling for generic event (not a veterinary event)"
+            )
             return df
-        
-        # If we get here, this is a vet event and should have been overridden by vet-specific functions
-        self.logger.warning("fill_missing_practice_types called for vet event but vet-specific functions not properly applied")
-        return df
+
+        if df is None or df.empty:
+            return df
+
+        if practices is None or practices.empty:
+            self.logger.warning(
+                "Practices reference data is empty; cannot fill missing practice types"
+            )
+            return df
+
+        matching_cfg = self.config.get("practice_matching", {}) or {}
+        company_col = matching_cfg.get("company_column", "Company Name")
+        practice_col = matching_cfg.get(
+            "practice_type_column", "Main Type of Veterinary Practice"
+        )
+        match_threshold = matching_cfg.get("match_threshold", 95)
+        missing_output_name = matching_cfg.get(
+            "missing_companies_output", "missing_practice_companies.csv"
+        )
+
+        if company_col not in practices.columns or practice_col not in practices.columns:
+            self.logger.warning(
+                "Practices dataset missing expected columns '%s' or '%s'",
+                company_col,
+                practice_col,
+            )
+            return df
+
+        df_copy = df.copy()
+
+        def _normalize_company(value: Optional[str]) -> str:
+            if not isinstance(value, str):
+                return ""
+            stripped = value.strip().lower()
+            return "".join(ch for ch in stripped if ch.isalnum())
+
+        # Build lookup of normalised company -> practice type
+        practices = practices.dropna(subset=[company_col])
+        practices["__normalized_company"] = practices[company_col].apply(
+            _normalize_company
+        )
+        practices = practices[practices["__normalized_company"] != ""]
+
+        practice_lookup: Dict[str, str] = {}
+        for _, row in practices.iterrows():
+            normalised = row["__normalized_company"]
+            practice_value = row.get(practice_col, "")
+            if pd.isna(practice_value) or str(practice_value).strip() == "":
+                continue
+            practice_lookup.setdefault(normalised, str(practice_value).strip())
+
+        if not practice_lookup:
+            self.logger.warning(
+                "No usable practice mappings found; skipping practice type filling"
+            )
+            return df
+
+        practice_keys = list(practice_lookup.keys())
+
+        practice_series = df_copy[column].astype(str).str.strip()
+        missing_mask = df_copy[column].isna() | (practice_series == "") | (
+            practice_series.str.lower() == "na"
+        )
+
+        exact_matches = 0
+        fuzzy_matches = 0
+        unmatched_records = {}
+
+        for idx, row in df_copy.loc[missing_mask].iterrows():
+            company_raw = row.get("Company")
+            if pd.isna(company_raw):
+                company_name = ""
+            elif isinstance(company_raw, str):
+                company_name = company_raw.strip()
+            else:
+                company_name = str(company_raw).strip()
+
+            normalised_company = _normalize_company(company_name)
+
+            matched = False
+
+            if normalised_company and normalised_company in practice_lookup:
+                df_copy.at[idx, column] = practice_lookup[normalised_company]
+                exact_matches += 1
+                matched = True
+            elif normalised_company and practice_keys:
+                best = process.extractOne(normalised_company, practice_keys)
+                if best:
+                    candidate_key, score = best
+                    if score >= match_threshold:
+                        df_copy.at[idx, column] = practice_lookup[candidate_key]
+                        fuzzy_matches += 1
+                        matched = True
+
+            if not matched:
+                if normalised_company:
+                    key = normalised_company
+                elif company_name:
+                    key = company_name.lower()
+                else:
+                    key = f"__missing_company__{idx}"
+
+                if key not in unmatched_records:
+                    unmatched_records[key] = {
+                        "Company": company_name or None,
+                        "NormalizedCompany": normalised_company,
+                        "PracticeColumn": column,
+                        "SourceEvent": self.main_event_name,
+                    }
+
+        self.logger.info(
+            "Practice filling stats for column '%s': exact=%d, fuzzy=%d, remaining_missing=%d",
+            column,
+            exact_matches,
+            fuzzy_matches,
+            len(unmatched_records),
+        )
+
+        # Persist unmatched companies across multiple invocations within the same run
+        if unmatched_records:
+            if not hasattr(self, "_practice_missing_records"):
+                self._practice_missing_records: Dict[str, Dict[str, str]] = {}
+            self._practice_missing_records.update(unmatched_records)
+
+        # Write aggregated unmatched companies to disk if configured
+        if (
+            hasattr(self, "_practice_missing_records")
+            and self._practice_missing_records
+            and missing_output_name
+        ):
+            output_path = os.path.join(self.output_dir, "output", missing_output_name)
+            def _sort_missing(item: Dict[str, Optional[str]]) -> str:
+                normalized = item.get("NormalizedCompany")
+                if isinstance(normalized, str) and normalized:
+                    return normalized
+                company_value = item.get("Company")
+                if isinstance(company_value, str) and company_value:
+                    return company_value.strip().lower()
+                return ""
+
+            missing_df = pd.DataFrame(
+                sorted(
+                    self._practice_missing_records.values(),
+                    key=_sort_missing,
+                )
+            )
+            missing_df.to_csv(output_path, index=False)
+            self.logger.info(
+                "Wrote %d unmatched practice companies to %s",
+                len(missing_df),
+                output_path,
+            )
+
+        return df_copy
 
     def combine_demographic_with_registration(self):
         """Process and combine demographic data with registration data."""
@@ -1440,19 +2007,20 @@ class RegistrationProcessor:
         # Use practice_type_columns from config for generic behavior
         practice_columns = self.config.get("practice_type_columns", {})
         this_year_col = practice_columns.get("current", "specialization_current")
-        past_year_col = practice_columns.get("past", "specialization_past")
+        past_year_col_bva = practice_columns.get("past_bva", "specialization_past")
+        past_year_col_lva = practice_columns.get("past_lva", "specialization_past")
 
-        self.logger.info(f"Using practice type columns - current: {this_year_col}, past: {past_year_col}")
+        self.logger.info(f"Using practice type columns - current: {this_year_col}, past BVA: {past_year_col_bva}, past LVA: {past_year_col_lva}")
 
         # Fill missing practice types using generic logic
         df_reg_demo_this = self.fill_missing_practice_types(
             df_reg_demo_this, practices, column=this_year_col
         )
         df_reg_demo_last_bva = self.fill_missing_practice_types(
-            df_reg_demo_last_bva, practices, column=past_year_col
+            df_reg_demo_last_bva, practices, column=past_year_col_bva
         )
         df_reg_demo_last_lva = self.fill_missing_practice_types(
-            df_reg_demo_last_lva, practices, column=past_year_col
+            df_reg_demo_last_lva, practices, column=past_year_col_lva
         )
         
         return df_reg_demo_this, df_reg_demo_last_bva, df_reg_demo_last_lva

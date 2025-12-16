@@ -1,7 +1,75 @@
 import logging
-from neo4j import GraphDatabase
 import os
+from typing import Any, Dict, Optional
+
 from dotenv import load_dotenv
+from neo4j import GraphDatabase
+
+
+_ENVIRONMENT_KEY_MAP = {
+    "prod": "PROD",
+    "production": "PROD",
+    "live": "PROD",
+    "dev": "DEV",
+    "development": "DEV",
+    "test": "TEST",
+    "testing": "TEST",
+    "qa": "TEST",
+    "stage": "TEST",
+    "staging": "TEST",
+}
+
+
+def resolve_neo4j_credentials(
+    config: Optional[Dict[str, Any]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, str]:
+    """Resolve Neo4j credentials from environment variables based on config."""
+
+    config = config or {}
+    neo4j_section = config.get("neo4j", {}) or {}
+    requested_env = str(neo4j_section.get("environment", "prod") or "prod").strip()
+    requested_env_lower = requested_env.lower()
+
+    resolved_key = _ENVIRONMENT_KEY_MAP.get(requested_env_lower)
+    if not resolved_key:
+        if logger:
+            logger.warning(
+                "Unknown Neo4j environment '%s'; defaulting to 'prod' settings",
+                requested_env,
+            )
+        resolved_key = "PROD"
+        requested_env_lower = "prod"
+
+    uri = os.getenv(f"NEO4J_URI_{resolved_key}")
+    password = os.getenv(f"NEO4J_PASSWORD_{resolved_key}")
+
+    # Fall back to config overrides or legacy env variables when specific ones are absent
+    if not uri:
+        uri = neo4j_section.get("uri") or os.getenv("NEO4J_URI")
+    if not password:
+        password = neo4j_section.get("password") or os.getenv("NEO4J_PASSWORD")
+
+    username = (
+        neo4j_section.get("username")
+        or os.getenv("NEO4J_USERNAME")
+        or os.getenv("NEO4J_USER")
+        or "neo4j"
+    )
+
+    if not uri or not password:
+        raise ValueError(
+            "Missing Neo4j credentials. Ensure the appropriate NEO4J_URI_* and "
+            "NEO4J_PASSWORD_* values are defined in your environment."
+        )
+
+    return {
+        "uri": uri,
+        "username": username,
+        "password": password,
+        "environment": requested_env_lower,
+        "resolved_key": resolved_key,
+    }
 
 
 class Neo4jConnection:
@@ -22,10 +90,11 @@ class Neo4jConnection:
         if "env_file" in config:
             load_dotenv(config["env_file"])
 
-        # Get Neo4j connection details from environment or config
-        self.uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        self.user = os.getenv("NEO4J_USER", "neo4j")
-        self.password = os.getenv("NEO4J_PASSWORD", "password")
+        credentials = resolve_neo4j_credentials(config, logger=self.logger)
+        self.uri = credentials["uri"]
+        self.user = credentials["username"]
+        self.password = credentials["password"]
+        self.environment = credentials["environment"]
 
         # Create Neo4j driver
         try:

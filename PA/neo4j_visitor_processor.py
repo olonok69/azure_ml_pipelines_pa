@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 import csv
 import inspect
 
+from utils.neo4j_utils import resolve_neo4j_credentials
+
 
 class Neo4jVisitorProcessor:
     """
@@ -28,6 +30,7 @@ class Neo4jVisitorProcessor:
         )
 
         self.config = config
+        self.mode = config.get("mode", "personal_agendas")
         self.output_dir = os.path.join(config["output_dir"], "output")
 
         # Get event configuration
@@ -50,15 +53,14 @@ class Neo4jVisitorProcessor:
 
         # Load the environment variables to get Neo4j credentials
         load_dotenv(config["env_file"])
-        self.uri = os.getenv("NEO4J_URI")
-        self.username = os.getenv("NEO4J_USERNAME")
-        self.password = os.getenv("NEO4J_PASSWORD")
-
-        if not self.uri or not self.username or not self.password:
-            self.logger.error(
-                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Missing Neo4j credentials in .env file"
-            )
-            raise ValueError("Missing Neo4j credentials in .env file")
+        credentials = resolve_neo4j_credentials(config, logger=self.logger)
+        self.uri = credentials["uri"]
+        self.username = credentials["username"]
+        self.password = credentials["password"]
+        self.neo4j_environment = credentials["environment"]
+        self.logger.info(
+            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Using Neo4j environment: {self.neo4j_environment}"
+        )
 
         # Initialize statistics dictionary with generic event names
         self.statistics = {
@@ -72,6 +74,11 @@ class Neo4jVisitorProcessor:
                 f"visitor_last_year_{self.main_event_name}": 0,
                 f"visitor_last_year_{self.secondary_event_name}": 0,
             },
+            "nodes_updated": {
+                "visitor_this_year": 0,
+                f"visitor_last_year_{self.main_event_name}": 0,
+                f"visitor_last_year_{self.secondary_event_name}": 0,
+            },
         }
 
         # Backward compatibility - add traditional BVA/LVA keys
@@ -79,6 +86,8 @@ class Neo4jVisitorProcessor:
         self.statistics["nodes_created"]["visitor_last_year_lva"] = 0
         self.statistics["nodes_skipped"]["visitor_last_year_bva"] = 0
         self.statistics["nodes_skipped"]["visitor_last_year_lva"] = 0
+        self.statistics["nodes_updated"]["visitor_last_year_bva"] = 0
+        self.statistics["nodes_updated"]["visitor_last_year_lva"] = 0
 
         self.logger.info(
             f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Neo4j Visitor Processor initialized successfully"
@@ -93,6 +102,7 @@ class Neo4jVisitorProcessor:
             f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Testing connection to Neo4j"
         )
 
+        driver = None
         try:
             driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
             with driver.session() as session:
@@ -109,7 +119,14 @@ class Neo4jVisitorProcessor:
             )
             return False
 
-    def load_csv_to_neo4j(self, csv_file_path, node_label, properties_map, create_only_new=False):
+    def load_csv_to_neo4j(
+        self,
+        csv_file_path,
+        node_label,
+        properties_map,
+        create_only_new=False,
+        force_create_only=False,
+    ):
         """
         Load a CSV file into Neo4j, creating nodes with the specified label and properties.
 
@@ -128,70 +145,81 @@ class Neo4jVisitorProcessor:
 
         # Get the unique identifier field
         unique_id_field = self.config.get("neo4j", {}).get("unique_identifiers", {}).get("visitor", "BadgeId")
-        
+
         nodes_created = 0
         nodes_skipped = 0
+        nodes_updated = 0
 
         try:
-            # Connect to Neo4j
             driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
 
-            # Read CSV file
             with open(csv_file_path, "r", encoding="utf-8") as csv_file:
                 reader = csv.DictReader(csv_file)
-                headers = reader.fieldnames
 
-                # Process each row in the CSV
-                for row in reader:
-                    # Create a dictionary of properties for this node
-                    properties = {}
-                    for csv_col, neo4j_prop in properties_map.items():
-                        if csv_col in row:
-                            properties[neo4j_prop] = row[csv_col]
-                    
-                    # Add a 'show' attribute to group all nodes belonging to this show
-                    properties["show"] = self.show_name
+                with driver.session() as session:
+                    for row in reader:
+                        properties = {}
+                        for csv_col, neo4j_prop in properties_map.items():
+                            if csv_col in row:
+                                properties[neo4j_prop] = row[csv_col]
 
-                    # Check if the unique ID is present
-                    if unique_id_field not in properties:
-                        self.logger.warning(
-                            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Unique ID field '{unique_id_field}' not found in row"
-                        )
-                        continue
+                        properties["show"] = self.show_name
 
-                    unique_id = properties[unique_id_field]
+                        if unique_id_field not in properties or not properties[unique_id_field]:
+                            self.logger.warning(
+                                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Unique ID field '{unique_id_field}' missing; skipping row"
+                            )
+                            nodes_skipped += 1
+                            continue
 
-                    # Create or merge the node
-                    with driver.session() as session:
-                        # Check if the node already exists
-                        if create_only_new:
-                            result = session.run(
-                                f"MATCH (n:{node_label} {{{unique_id_field}: $unique_id}}) RETURN n",
+                        unique_id = properties[unique_id_field]
+
+                        try:
+                            exists_query = session.run(
+                                f"MATCH (n:{node_label} {{{unique_id_field}: $unique_id}}) RETURN count(n) AS cnt",
                                 unique_id=unique_id,
                             )
-                            if result.single():
-                                self.logger.debug(
-                                    f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Node {node_label} with {unique_id_field}={unique_id} already exists, skipping"
-                                )
+                            exists = exists_query.single()["cnt"] > 0
+
+                            if exists and force_create_only:
                                 nodes_skipped += 1
                                 continue
 
-                        # Create the node
-                        query = f"CREATE (n:{node_label} $props) RETURN n"
-                        session.run(query, props=properties)
-                        nodes_created += 1
+                            merge_query = (
+                                f"MERGE (n:{node_label} {{{unique_id_field}: $unique_id}}) "
+                                "SET n += $props "
+                                "RETURN n"
+                            )
+                            session.run(merge_query, unique_id=unique_id, props=properties)
 
-            driver.close()
+                            if exists:
+                                if force_create_only:
+                                    # Should never reach here due to continue above, but guard for safety
+                                    nodes_skipped += 1
+                                else:
+                                    nodes_updated += 1
+                            else:
+                                nodes_created += 1
+
+                        except Exception as merge_error:
+                            nodes_skipped += 1
+                            self.logger.error(
+                                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Error merging visitor node {unique_id}: {merge_error}"
+                            )
+
             self.logger.info(
-                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Created {nodes_created} nodes and skipped {nodes_skipped} nodes"
+                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Created {nodes_created} nodes, updated {nodes_updated}, skipped {nodes_skipped}"
             )
-            return nodes_created, nodes_skipped
+            return nodes_created, nodes_skipped, nodes_updated
 
         except Exception as e:
             self.logger.error(
                 f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Error loading CSV to Neo4j: {str(e)}"
             )
-            return 0, 0
+            return 0, 0, 0
+        finally:
+            if driver:
+                driver.close()
 
     def process(self, create_only_new=False):
         """
@@ -228,12 +256,19 @@ class Neo4jVisitorProcessor:
             properties_map = {col: col for col in data.columns}
             node_label = node_labels.get("visitor_this_year", "Visitor_this_year")
 
-            nodes_created, nodes_skipped = self.load_csv_to_neo4j(
-                csv_file_path, node_label, properties_map, create_only_new
+            force_create_only = self.mode == "post_analysis"
+
+            nodes_created, nodes_skipped, nodes_updated = self.load_csv_to_neo4j(
+                csv_file_path,
+                node_label,
+                properties_map,
+                create_only_new,
+                force_create_only=force_create_only,
             )
 
             self.statistics["nodes_created"]["visitor_this_year"] = nodes_created
             self.statistics["nodes_skipped"]["visitor_this_year"] = nodes_skipped
+            self.statistics["nodes_updated"]["visitor_this_year"] = nodes_updated
         except Exception as e:
             self.logger.error(
                 f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Error processing visitors from this year: {str(e)}"
@@ -252,17 +287,19 @@ class Neo4jVisitorProcessor:
             properties_map = {col: col for col in data.columns}
             node_label = node_labels.get("visitor_last_year_bva", "Visitor_last_year_bva")
 
-            nodes_created, nodes_skipped = self.load_csv_to_neo4j(
+            nodes_created, nodes_skipped, nodes_updated = self.load_csv_to_neo4j(
                 csv_file_path, node_label, properties_map, create_only_new
             )
 
             # Update statistics for both generic and backward compatibility keys
             self.statistics["nodes_created"][f"visitor_last_year_{self.main_event_name}"] = nodes_created
             self.statistics["nodes_skipped"][f"visitor_last_year_{self.main_event_name}"] = nodes_skipped
+            self.statistics["nodes_updated"][f"visitor_last_year_{self.main_event_name}"] = nodes_updated
             
             # Also update the bva key for backward compatibility
             self.statistics["nodes_created"]["visitor_last_year_bva"] = nodes_created
             self.statistics["nodes_skipped"]["visitor_last_year_bva"] = nodes_skipped
+            self.statistics["nodes_updated"]["visitor_last_year_bva"] = nodes_updated
         except Exception as e:
             self.logger.error(
                 f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Error processing visitors from last year {self.main_event_name}: {str(e)}"
@@ -281,17 +318,19 @@ class Neo4jVisitorProcessor:
             properties_map = {col: col for col in data.columns}
             node_label = node_labels.get("visitor_last_year_lva", "Visitor_last_year_lva")
 
-            nodes_created, nodes_skipped = self.load_csv_to_neo4j(
+            nodes_created, nodes_skipped, nodes_updated = self.load_csv_to_neo4j(
                 csv_file_path, node_label, properties_map, create_only_new
             )
 
             # Update statistics for both generic and backward compatibility keys
             self.statistics["nodes_created"][f"visitor_last_year_{self.secondary_event_name}"] = nodes_created
             self.statistics["nodes_skipped"][f"visitor_last_year_{self.secondary_event_name}"] = nodes_skipped
+            self.statistics["nodes_updated"][f"visitor_last_year_{self.secondary_event_name}"] = nodes_updated
             
             # Also update the lva key for backward compatibility
             self.statistics["nodes_created"]["visitor_last_year_lva"] = nodes_created
             self.statistics["nodes_skipped"]["visitor_last_year_lva"] = nodes_skipped
+            self.statistics["nodes_updated"]["visitor_last_year_lva"] = nodes_updated
         except Exception as e:
             self.logger.error(
                 f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Error processing visitors from last year {self.secondary_event_name}: {str(e)}"
@@ -305,10 +344,19 @@ class Neo4jVisitorProcessor:
             f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Visitors this year: {self.statistics['nodes_created']['visitor_this_year']} created, {self.statistics['nodes_skipped']['visitor_this_year']} skipped"
         )
         self.logger.info(
+            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Visitors this year updated: {self.statistics['nodes_updated']['visitor_this_year']}"
+        )
+        self.logger.info(
             f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Visitors last year {self.main_event_name}: {self.statistics['nodes_created'][f'visitor_last_year_{self.main_event_name}']} created, {self.statistics['nodes_skipped'][f'visitor_last_year_{self.main_event_name}']} skipped"
         )
         self.logger.info(
+            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Visitors last year {self.main_event_name} updated: {self.statistics['nodes_updated'][f'visitor_last_year_{self.main_event_name}']}"
+        )
+        self.logger.info(
             f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Visitors last year {self.secondary_event_name}: {self.statistics['nodes_created'][f'visitor_last_year_{self.secondary_event_name}']} created, {self.statistics['nodes_skipped'][f'visitor_last_year_{self.secondary_event_name}']} skipped"
+        )
+        self.logger.info(
+            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Visitors last year {self.secondary_event_name} updated: {self.statistics['nodes_updated'][f'visitor_last_year_{self.secondary_event_name}']}"
         )
 
         self.logger.info(

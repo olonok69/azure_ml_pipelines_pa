@@ -34,7 +34,7 @@ def run_registration_processing(config):
     reg_processor = RegistrationProcessor(config)
     
     # Apply event-specific enhancements based on event type
-    if main_event_name in ["bva", "veterinary", "vet"]:
+    if main_event_name in ["bva", "lva"]:
         logger.info("Detected veterinary event - applying veterinary-specific processing functions")
         try:
             from utils import vet_specific_functions
@@ -124,115 +124,117 @@ def run_neo4j_processing(config, create_only_new=True, steps_to_run=None):
     # Check if specific steps are requested
     run_all = steps_to_run is None
 
+    # Helper to decide logging for non-selected steps
+    def _log_non_selected(step_num: int, name: str):
+        # Only log an INFO skip if explicitly disabled in config; otherwise keep noise down
+        enabled_map = {
+            4: config.get("pipeline_steps", {}).get("neo4j_visitor_processing", True),
+            5: config.get("pipeline_steps", {}).get("neo4j_session_processing", True),
+            6: config.get("pipeline_steps", {}).get("neo4j_job_stream_processing", True),
+            7: config.get("pipeline_steps", {}).get("neo4j_specialization_stream_processing", True),
+            8: config.get("pipeline_steps", {}).get("neo4j_visitor_relationship_processing", True),
+            9: config.get("pipeline_steps", {}).get("session_embedding_processing", True),
+            10: config.get("pipeline_steps", {}).get("session_recommendation_processing", True),
+        }
+        if not enabled_map.get(step_num, True):
+            logger.info(f"Skipping step {step_num}: {name} (disabled in config)")
+        elif run_all:
+            # run_all handled elsewhere, so this path shouldn't occur
+            logger.debug(f"Step {step_num} not executed (unexpected path)")
+        else:
+            # Not selected in steps_to_run: keep log level low
+            logger.debug(f"Step {step_num} not in selected steps list; not executing {name}")
+
     # Neo4j visitor processor (Step 4)
-    if (run_all or 4 in steps_to_run) and config.get("pipeline_steps", {}).get(
-        "neo4j_visitor_processing", True
-    ):
-        logger.info("Starting step 4: Neo4j visitor data processing")
-        neo4j_visitor_processor = Neo4jVisitorProcessor(config)
-        neo4j_visitor_processor.process(create_only_new=create_only_new)
-        processors["neo4j_visitor_processor"] = neo4j_visitor_processor
-        logger.info("Completed step 4: Neo4j visitor data processing")
+    if (run_all or 4 in steps_to_run):
+        if config.get("pipeline_steps", {}).get("neo4j_visitor_processing", True):
+            logger.info("Starting step 4: Neo4j visitor data processing")
+            neo4j_visitor_processor = Neo4jVisitorProcessor(config)
+            neo4j_visitor_processor.process(create_only_new=create_only_new)
+            processors["neo4j_visitor_processor"] = neo4j_visitor_processor
+            logger.info("Completed step 4: Neo4j visitor data processing")
+        else:
+            logger.info("Skipping step 4: Neo4j visitor data processing (disabled in config)")
     else:
-        logger.info(
-            "Skipping step 4: Neo4j visitor data processing (disabled in config or not in selected steps)"
-        )
+        _log_non_selected(4, "Neo4j visitor data processing")
 
     # Neo4j session processor (Step 5)
-    if (run_all or 5 in steps_to_run) and config.get("pipeline_steps", {}).get(
-        "neo4j_session_processing", True
-    ):
-        logger.info("Starting step 5: Neo4j session data processing")
-        neo4j_session_processor = Neo4jSessionProcessor(config)
-        neo4j_session_processor.process(create_only_new=create_only_new)
-        processors["neo4j_session_processor"] = neo4j_session_processor
-        logger.info("Completed step 5: Neo4j session data processing")
+    if (run_all or 5 in steps_to_run):
+        if config.get("pipeline_steps", {}).get("neo4j_session_processing", True):
+            logger.info("Starting step 5: Neo4j session data processing")
+            neo4j_session_processor = Neo4jSessionProcessor(config)
+            neo4j_session_processor.process(create_only_new=create_only_new)
+            processors["neo4j_session_processor"] = neo4j_session_processor
+            logger.info("Completed step 5: Neo4j session data processing")
+        else:
+            logger.info("Skipping step 5: Neo4j session data processing (disabled in config)")
     else:
-        logger.info(
-            "Skipping step 5: Neo4j session data processing (disabled in config or not in selected steps)"
-        )
+        _log_non_selected(5, "Neo4j session data processing")
 
     # Neo4j job stream processor (Step 6)
-    if (run_all or 6 in steps_to_run) and config.get("pipeline_steps", {}).get(
-        "neo4j_job_stream_processing", True
-    ):
-        logger.info("Starting step 6: Neo4j job to stream relationship processing")
-        neo4j_job_stream_processor = Neo4jJobStreamProcessor(config)
-        neo4j_job_stream_processor.process(create_only_new=create_only_new)
-        processors["neo4j_job_stream_processor"] = neo4j_job_stream_processor
-        logger.info("Completed step 6: Neo4j job to stream relationship processing")
+    if (run_all or 6 in steps_to_run):
+        if config.get("pipeline_steps", {}).get("neo4j_job_stream_processing", True):
+            logger.info("Starting step 6: Neo4j job to stream relationship processing")
+            neo4j_job_stream_processor = Neo4jJobStreamProcessor(config)
+            neo4j_job_stream_processor.process(create_only_new=create_only_new)
+            processors["neo4j_job_stream_processor"] = neo4j_job_stream_processor
+            logger.info("Completed step 6: Neo4j job to stream relationship processing")
+        else:
+            logger.info("Skipping step 6: Neo4j job to stream relationship processing (disabled in config)")
     else:
-        logger.info(
-            "Skipping step 6: Neo4j job to stream relationship processing (disabled in config or not in selected steps)"
-        )
+        _log_non_selected(6, "Neo4j job to stream relationship processing")
 
     # Neo4j specialization stream processor (Step 7)
-    if (run_all or 7 in steps_to_run) and config.get("pipeline_steps", {}).get(
-        "neo4j_specialization_stream_processing", True
-    ):
-        logger.info(
-            "Starting step 7: Neo4j specialization to stream relationship processing"
-        )
-        neo4j_specialization_stream_processor = Neo4jSpecializationStreamProcessor(
-            config
-        )
-        neo4j_specialization_stream_processor.process(create_only_new=create_only_new)
-        processors["neo4j_specialization_stream_processor"] = (
-            neo4j_specialization_stream_processor
-        )
-        logger.info(
-            "Completed step 7: Neo4j specialization to stream relationship processing"
-        )
+    if (run_all or 7 in steps_to_run):
+        if config.get("pipeline_steps", {}).get("neo4j_specialization_stream_processing", True):
+            logger.info("Starting step 7: Neo4j specialization to stream relationship processing")
+            neo4j_specialization_stream_processor = Neo4jSpecializationStreamProcessor(config)
+            neo4j_specialization_stream_processor.process(create_only_new=create_only_new)
+            processors["neo4j_specialization_stream_processor"] = neo4j_specialization_stream_processor
+            logger.info("Completed step 7: Neo4j specialization to stream relationship processing")
+        else:
+            logger.info("Skipping step 7: Neo4j specialization to stream relationship processing (disabled in config)")
     else:
-        logger.info(
-            "Skipping step 7: Neo4j specialization to stream relationship processing (disabled in config or not in selected steps)"
-        )
+        _log_non_selected(7, "Neo4j specialization to stream relationship processing")
 
     # Neo4j visitor relationship processor (Step 8)
-    if (run_all or 8 in steps_to_run) and config.get("pipeline_steps", {}).get(
-        "neo4j_visitor_relationship_processing", True
-    ):
-        logger.info("Starting step 8: Neo4j visitor relationship processing")
-        neo4j_visitor_relationship_processor = Neo4jVisitorRelationshipProcessor(config)
-        neo4j_visitor_relationship_processor.process(create_only_new=create_only_new)
-        processors["neo4j_visitor_relationship_processor"] = (
-            neo4j_visitor_relationship_processor
-        )
-        logger.info("Completed step 8: Neo4j visitor relationship processing")
+    if (run_all or 8 in steps_to_run):
+        if config.get("pipeline_steps", {}).get("neo4j_visitor_relationship_processing", True):
+            logger.info("Starting step 8: Neo4j visitor relationship processing")
+            neo4j_visitor_relationship_processor = Neo4jVisitorRelationshipProcessor(config)
+            neo4j_visitor_relationship_processor.process(create_only_new=create_only_new)
+            processors["neo4j_visitor_relationship_processor"] = neo4j_visitor_relationship_processor
+            logger.info("Completed step 8: Neo4j visitor relationship processing")
+        else:
+            logger.info("Skipping step 8: Neo4j visitor relationship processing (disabled in config)")
     else:
-        logger.info(
-            "Skipping step 8: Neo4j visitor relationship processing (disabled in config or not in selected steps)"
-        )
+        _log_non_selected(8, "Neo4j visitor relationship processing")
 
     # Session embedding processor (Step 9)
-    if (run_all or 9 in steps_to_run) and config.get("pipeline_steps", {}).get(
-        "session_embedding_processing", True
-    ):
-        logger.info("Starting step 9: Session embedding processing")
-        session_embedding_processor = SessionEmbeddingProcessor(config)
-        session_embedding_processor.process(create_only_new=create_only_new)
-        processors["session_embedding_processor"] = session_embedding_processor
-        logger.info("Completed step 9: Session embedding processing")
+    if (run_all or 9 in steps_to_run):
+        if config.get("pipeline_steps", {}).get("session_embedding_processing", True):
+            logger.info("Starting step 9: Session embedding processing")
+            session_embedding_processor = SessionEmbeddingProcessor(config)
+            session_embedding_processor.process(create_only_new=create_only_new)
+            processors["session_embedding_processor"] = session_embedding_processor
+            logger.info("Completed step 9: Session embedding processing")
+        else:
+            logger.info("Skipping step 9: Session embedding processing (disabled in config)")
     else:
-        logger.info(
-            "Skipping step 9: Session embedding processing (disabled in config or not in selected steps)"
-        )
+        _log_non_selected(9, "Session embedding processing")
 
     # Session recommendation processor (Step 10)
-    if (run_all or 10 in steps_to_run) and config.get("pipeline_steps", {}).get(
-        "session_recommendation_processing", True
-    ):
-        logger.info("Starting step 10: Session recommendation processing")
-        session_recommendation_processor = SessionRecommendationProcessor(config)
-        session_recommendation_processor.process(create_only_new=create_only_new)
-        processors["session_recommendation_processor"] = (
-            session_recommendation_processor
-        )
-        logger.info("Completed step 10: Session recommendation processing")
+    if (run_all or 10 in steps_to_run):
+        if config.get("pipeline_steps", {}).get("session_recommendation_processing", True):
+            logger.info("Starting step 10: Session recommendation processing")
+            session_recommendation_processor = SessionRecommendationProcessor(config)
+            session_recommendation_processor.process(create_only_new=create_only_new)
+            processors["session_recommendation_processor"] = session_recommendation_processor
+            logger.info("Completed step 10: Session recommendation processing")
+        else:
+            logger.info("Skipping step 10: Session recommendation processing (disabled in config)")
     else:
-        logger.info(
-            "Skipping step 10: Session recommendation processing (disabled in config or not in selected steps)"
-        )
+        _log_non_selected(10, "Session recommendation processing")
 
     return processors
 

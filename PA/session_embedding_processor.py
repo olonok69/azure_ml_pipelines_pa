@@ -17,6 +17,8 @@ from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
+from utils.neo4j_utils import resolve_neo4j_credentials
+
 
 class SessionEmbeddingProcessor:
     """
@@ -54,15 +56,15 @@ class SessionEmbeddingProcessor:
 
         # Load the environment variables to get Neo4j credentials
         load_dotenv(config["env_file"])
-        self.uri = os.getenv("NEO4J_URI")
-        self.username = os.getenv("NEO4J_USERNAME")
-        self.password = os.getenv("NEO4J_PASSWORD")
+        credentials = resolve_neo4j_credentials(config, logger=self.logger)
+        self.uri = credentials["uri"]
+        self.username = credentials["username"]
+        self.password = credentials["password"]
+        self.neo4j_environment = credentials["environment"]
 
-        if not self.uri or not self.username or not self.password:
-            self.logger.error(
-                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Missing Neo4j credentials in .env file"
-            )
-            raise ValueError("Missing Neo4j credentials in .env file")
+        self.logger.info(
+            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Using Neo4j environment: {self.neo4j_environment}"
+        )
 
         # Initialize embedding model
         self.model_name = config.get("embeddings", {}).get("model", "all-MiniLM-L6-v2")
@@ -190,6 +192,10 @@ class SessionEmbeddingProcessor:
             
             # Filter by node labels
             where_conditions.append("(s:Sessions_this_year OR s:Sessions_past_year)")
+
+            # Skip placeholder sessions with no meaningful text to embed
+            # This prevents creating identical embeddings for empty/null content
+            where_conditions.append("(coalesce(s.title,'') <> '' OR coalesce(s.synopsis_stripped,'') <> '' OR coalesce(s.theatre__name,'') <> '' OR coalesce(s.key_text,'') <> '' OR coalesce(s.stream,'') <> '')")
             
             where_clause = "WHERE " + " AND ".join(where_conditions)
 

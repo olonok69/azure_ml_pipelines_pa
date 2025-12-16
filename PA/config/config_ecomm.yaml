@@ -1,6 +1,10 @@
 # Event-specific configuration for ECOMM events
 # This configuration file contains all event-specific settings and output file names
-
+mode: "post_analysis"  # can be engagement | personal_agendas | post_analysis
+# Documentation assets surfaced by the application
+documentation:
+  generic_pipeline_map: "docs/generic_pipeline_map.svg"
+  show_pipeline_map: "docs/ecomm_pipeline_complete.svg"
 # Event configuration - CHANGED FOR ECOMM
 event:
   name: "ecomm"
@@ -17,6 +21,28 @@ event:
   shows_last_year_secondary:
     - "TFM24"  # CHANGED: "LVS2024" -> "TFM24"
 
+# Engagement-specific overrides applied when mode: "engagement"
+engagement_mode:
+  registration_shows:
+    this_year_main:
+      - "ECE24"
+    this_year_secondary:
+      - "TFM24"
+    last_year_main: []  # No deeper historical data currently available
+    last_year_secondary: []
+    drop_last_year_when_missing: true
+  reset_returning_flags: true
+
+post_analysis_mode:
+  registration_shows:
+    this_year_main:
+      - ['ECE25','TFM25']
+  scan_files:
+    seminars_scan_reference_this: "data/ecomm/post/ecetfm2025 seminar scans reference.csv"
+    seminars_scans_this: "data/ecomm/post/ecetfm2025 seminar scans.csv"
+  entry_scan_files:
+    entry_scans_this: ["data/ecomm/post/ece25_unfiltered_entry_scans.csv", "data/ecomm/post/tfm25_unfiltered_entry_scans.csv"]
+
 # Badge history column names (SAME AS VET)
 badge_history_columns:
   main_event: "BadgeId_last_year_bva"
@@ -25,7 +51,8 @@ badge_history_columns:
 # Practice type column names for different years - CHANGED FOR ECOMM
 practice_type_columns:
   current: "what_best_describes_what_you_do"  # CHANGED: ECOMM question
-  past: "what_best_describes_your_specialism"  # CHANGED: ECOMM question
+  past_bva: "what_best_describes_your_specialism"  # CHANGED: ECOMM question
+  past_lva: "what_best_describes_your_specialism"  # CHANGED: ECOMM question
 
 # Practice matching configuration (GENERIC - SAME STRUCTURE)
 practice_matching:
@@ -79,7 +106,7 @@ output_files:
     filename_pattern: "visitor_recommendations_{timestamp}"  # Pattern for output files
     save_csv: true
 # Pipeline control settings (SAME AS VET)
-create_only_new: false  # If true, only process new visitors without recommendations
+create_only_new: true  # If true, only process new visitors without recommendations
 
 # Pipeline step activation settings - UPDATED FOR NEO4J SESSION PROCESSING
 pipeline_steps:
@@ -97,10 +124,11 @@ pipeline_steps:
   session_recommendation_processing: true  # Enable session recommendation processing
 
 # Input file paths - CHANGED FOR ECOMM
+old_format: true
 input_files:
-  main_event_registration: "data/ecomm/20250818_registration_ECE_TFM_24_25.json"  # CHANGED
+  main_event_registration: "data/ecomm/20251008_registration_ECE_TFM_24_25.json"  # CHANGED
   secondary_event_registration: "data/ecomm/20250722_registration_TFM24.json"  # CHANGED
-  main_event_demographic: "data/ecomm/20250818_demographics_ECE_TFM_24_25.json"  # CHANGED
+  main_event_demographic: "data/ecomm/20251008_demographics_ECE_TFM_24_25.json"  # CHANGED
   secondary_event_demographic: "data/ecomm/20250722_demographics_TFM24.json"  # CHANGED
   # practices: "data/ecomm/practices_missing.csv"  # CHANGED
 
@@ -123,12 +151,26 @@ session_files:
 # Stream processing configuration
 stream_processing:
   use_cached_descriptions: false
+  create_missing_streams: true
+  use_enhanced_streams_catalog: true 
 
 # Scan output files
 scan_output_files:
   processed_scans:
-    last_year_main: "scan_bva_past.csv"   # Changed from bva to ecomm
-    last_year_secondary: "scan_lva_past.csv"  # Changed from lva to tfm
+    this_year: "scan_this_filtered_valid_cols.csv"
+    last_year_main: "scan_last_filtered_valid_cols_bva.csv"
+    last_year_secondary: "scan_last_filtered_valid_cols_lva.csv"
+    this_year_post: "scan_this_year_post.csv"
+  sessions_visited:
+    main_event: "sessions_visited_last_bva.csv"
+    secondary_event: "sessions_visited_last_lva.csv"
+    this_year_post: "sessions_visited_this_year.csv"
+  # Added explicit filenames used by attended_session relationship creation logic (currently hard-coded in processor)
+  attended_session_inputs:
+    past_year_main_scan: "scan_bva_past.csv"            # Raw past-year main scan file actually consumed when building attended_session
+    past_year_secondary_scan: "scan_lva_past.csv"       # Raw past-year secondary scan file actually consumed
+    past_year_main_filter: "df_reg_demo_last_bva.csv"    # Registration+demo filter file for main past year visitors
+    past_year_secondary_filter: "df_reg_demo_last_lva.csv" # Registration+demo filter file for secondary past year visitors
 
 # Session output file configuration
 session_output_files:
@@ -137,7 +179,7 @@ session_output_files:
     last_year_main: "session_last_filtered_valid_cols_bva.csv"   # Changed from bva to ecomm
     last_year_secondary: "session_last_filtered_valid_cols_lva.csv"  # Changed from lva to tfm
   streams_catalog: "streams.json"
-  
+
 # Session processing configuration (SAME STRUCTURE)
 # ECOMM-specific titles to remove during session filtering
 titles_to_remove:
@@ -166,18 +208,33 @@ embeddings:
 # Session recommendation configuration
 
 recommendation:
-  min_similarity_score: 0.3       # Minimum similarity score (0.0-1.0) for recommendations
+  min_similarity_score: 0.5       # Minimum similarity score (0.0-1.0) for recommendations
   max_recommendations: 20         # Maximum number of recommendations per visitor
   similar_visitors_count: 3       # Number of similar visitors to consider for new visitors
+  resolve_overlapping_sessions_by_similarity: true 
+  control_group:                  # Control-group defaults (only active in personal_agendas mode)
+    enabled: false
+    percentage: 5                 # Expressed as percent (5 => 5%)
+    random_seed: 42
+    file_suffix: "_control"
+    output_directory: "recommendations/control"
+    neo4j_property: "control_group"
   use_langchain: false            # Whether to use LangChain for filtering
   enable_filtering: false         # Disable filtering for ECOMM shows
+  # Additional visitor fields to include directly in exported recommendations CSV (enrichment)
+  export_additional_visitor_fields:
+    - Email
+    - Forename
+    - Surname
+    - Tel
+    - Mobile
   
   # Similarity attributes for finding similar visitors (ecomm-specific)
   similarity_attributes:
-    what_is_your_job_role: 1.0
-    what_best_describes_what_you_do: 1.0
-    what_is_your_industry: 0.8
-    what_is_the_main_solution_you_are_most_excited_to_discover_at_the_show: 0.6
+    what_is_your_job_role: 0.6
+    what_best_describes_what_you_do: 0.8
+    what_is_your_industry: 1.0
+    what_is_the_main_solution_you_are_most_excited_to_discover_at_the_show: 1.0
     Country: 0.3
     why_are_you_attending: 0.6
   
@@ -194,9 +251,7 @@ recommendation:
 
 # Neo4j configuration (SAME STRUCTURE - different database)
 neo4j:
-  uri: "neo4j+s://928872b4.databases.neo4j.io"
-  username: "neo4j"
-  password: ""
+  environment: "prod"
   show_name: "ecomm"  # ADDED: Show attribute for ECOMM nodes
   node_labels:
     visitor_this_year: "Visitor_this_year"
@@ -205,16 +260,20 @@ neo4j:
     session_this_year: "Sessions_this_year"
     session_past_year: "Sessions_past_year"
     stream: "Stream"
+    show_this_year: "Show_this_year"
   unique_identifiers:
     visitor: "BadgeId"  # Field to use as unique identifier for visitor nodes
     session: "session_id"  # Field to use as unique identifier for session nodes
     stream: "stream"  # Field to use as unique identifier for stream nodes
+    show: "show_ref"
   relationships:
     session_stream: "HAS_STREAM"  # Relationship between sessions and streams
     job_stream: "job_to_stream"  # Relationship between job roles and streams
     specialization_stream: "specialization_to_stream"  # Relationship between specializations and streams
     same_visitor: "Same_Visitor"  # Relationship between visitors this year and last year
     attended_session: "attended_session"  # Relationship between visitors and sessions they attended
+    assisted_session_this_year: "assisted_session_this_year"  # Post-analysis session attendance
+    registered_to_show: "registered_to_show"  # Entry scan registration relationship
   
   # NEW: Job stream mapping configuration with skip support
   job_stream_mapping:

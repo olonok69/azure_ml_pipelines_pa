@@ -12,14 +12,19 @@ FIXED: Matches production old_session_processor.py functionality exactly.
 """
 
 import os
+import re
 import json
-import string
 import logging
-import pandas as pd
+import shutil
 import functools
-from typing import Dict, List, Set, Any
+from datetime import datetime
+from collections import defaultdict
+from typing import Dict, List, Set, Any, Optional
+
+import pandas as pd
 from dotenv import load_dotenv, dotenv_values
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
 
 # Configure logger
@@ -78,6 +83,30 @@ class SessionProcessor:
         # Load map_vets and titles_to_remove from config
         self.map_vets = self.config.get("map_vets", {})
         self.titles_to_remove = self.config.get("titles_to_remove", [])
+        self.session_output_config = self.config.get("session_output_files", {})
+        self.session_processed_files = self.session_output_config.get(
+            "processed_sessions", {}
+        )
+
+        self.stream_processing_config = self.config.get("stream_processing", {})
+        self.create_missing_streams = self.stream_processing_config.get(
+            "create_missing_streams", False
+        )
+        self.use_enhanced_streams_catalog = self.stream_processing_config.get(
+            "use_enhanced_streams_catalog", False
+        )
+
+        self.session_file_paths: Dict[str, str] = {}
+        self.backfill_metrics: Dict[str, int] = {
+            "files_evaluated": 0,
+            "files_modified": 0,
+            "total_missing_streams": 0,
+            "sessions_backfilled": 0,
+            "sessions_skipped_empty_synopsis": 0,
+            "sessions_skipped_no_candidates": 0,
+            "sessions_failed_llm": 0,
+        }
+        self._streams_by_theatre: Optional[Dict[str, Set[str]]] = None
 
     def load_env_variables(self) -> None:
         """Load environment variables for API access."""
@@ -186,6 +215,17 @@ class SessionProcessor:
                 "title"
             ].apply(self.clean_text)
 
+            # Deterministic sort before de-dup so we consistently keep the earliest scheduled session
+            def stable_sort(df: pd.DataFrame) -> pd.DataFrame:
+                sort_cols = [c for c in ["date", "start_time", "session_id"] if c in df.columns]
+                if sort_cols:
+                    return df.sort_values(by=sort_cols, ascending=True, kind="stable")
+                return df
+
+            self.session_this_filtered = stable_sort(self.session_this_filtered)
+            self.session_last_filtered_bva = stable_sort(self.session_last_filtered_bva)
+            self.session_last_filtered_lva = stable_sort(self.session_last_filtered_lva)
+
             # Remove duplicates based on key_text
             self.session_this_filtered = self.session_this_filtered.drop_duplicates(
                 subset=["key_text"]
@@ -245,6 +285,37 @@ class SessionProcessor:
             )
             self.session_last_filtered_valid_cols_lva = (
                 self.session_last_filtered_valid_cols_lva.fillna("")
+            )
+
+            # Upstream data-quality gate: drop and quarantine placeholder rows (e.g., blank titles)
+            def drop_and_quarantine(df: pd.DataFrame, name: str) -> pd.DataFrame:
+                required_text_fields = ["title", "synopsis_stripped", "theatre__name", "key_text", "stream"]
+                # Identify placeholder rows: all core text fields blank OR title blank
+                is_blank = df[required_text_fields].apply(lambda s: s.astype(str).str.strip() == "").all(axis=1)
+                is_title_blank = df["title"].astype(str).str.strip() == ""
+                mask_quarantine = is_blank | is_title_blank
+                quarantined = df[mask_quarantine].copy()
+                cleaned = df[~mask_quarantine].copy()
+
+                if len(quarantined) > 0:
+                    q_path = os.path.join(self.output_dir, "output", f"quarantined_sessions_{name}.csv")
+                    try:
+                        quarantined.to_csv(q_path, index=False)
+                        self.logger.warning(
+                            f"Quarantined {len(quarantined)} placeholder sessions from {name} → {q_path}"
+                        )
+                    except Exception as e:
+                        self.logger.error(f"Failed to write quarantine file for {name}: {e}")
+                return cleaned
+
+            self.session_this_filtered_valid_cols = drop_and_quarantine(
+                self.session_this_filtered_valid_cols, "this_year"
+            )
+            self.session_last_filtered_valid_cols_bva = drop_and_quarantine(
+                self.session_last_filtered_valid_cols_bva, "past_year_bva"
+            )
+            self.session_last_filtered_valid_cols_lva = drop_and_quarantine(
+                self.session_last_filtered_valid_cols_lva, "past_year_lva"
             )
 
             self.logger.info("Selected relevant columns and cleaned data")
@@ -386,7 +457,10 @@ class SessionProcessor:
     def save_streams_catalog(self) -> None:
         """Save the streams catalog to JSON file."""
         try:
-            output_path = os.path.join(self.output_dir, "output", "streams.json")
+            streams_filename = self.session_output_config.get(
+                "streams_catalog", "streams.json"
+            )
+            output_path = os.path.join(self.output_dir, "output", streams_filename)
 
             with open(output_path, "w") as json_file:
                 json.dump(self.streams_catalog, json_file, indent=4)
@@ -396,6 +470,389 @@ class SessionProcessor:
         except Exception as e:
             self.logger.error(f"Error saving stream catalog: {e}", exc_info=True)
             raise
+
+    def _ensure_language_model(self) -> bool:
+        """Ensure an LLM instance is available for downstream classification."""
+        if hasattr(self, "llm") and self.llm:
+            return True
+
+        try:
+            if "AZURE_API_KEY" in self.env_config:
+                self.llm = AzureChatOpenAI(
+                    azure_endpoint=self.env_config.get("AZURE_ENDPOINT"),
+                    openai_api_version=self.env_config.get("AZURE_API_VERSION"),
+                    deployment_name=self.env_config.get(
+                        "AZURE_DEPLOYMENT", "gpt-4o-mini"
+                    ),
+                    openai_api_key=self.env_config["AZURE_API_KEY"],
+                    temperature=0.3,
+                )
+                self.logger.info("Initialized Azure OpenAI language model for stream backfill")
+                return True
+
+            if "OPENAI_API_KEY" in self.env_config:
+                self.llm = ChatOpenAI(
+                    model="gpt-4o-mini",
+                    temperature=0.3,
+                    openai_api_key=self.env_config["OPENAI_API_KEY"],
+                )
+                self.logger.info("Initialized OpenAI language model for stream backfill")
+                return True
+
+            self.logger.warning(
+                "Language model credentials not available; stream backfill will be skipped"
+            )
+            self.llm = None
+            return False
+
+        except Exception as e:
+            self.logger.error(
+                f"Failed to initialize language model for stream backfill: {e}",
+                exc_info=True,
+            )
+            self.llm = None
+            return False
+
+    def _load_stream_catalog_for_backfill(self) -> Dict[str, str]:
+        """Load the stream catalog used for classifying missing streams."""
+        if hasattr(self, "_backfill_stream_catalog"):
+            return getattr(self, "_backfill_stream_catalog")
+
+        streams_filename = self.session_output_config.get(
+            "streams_catalog", "streams.json"
+        )
+        output_root = os.path.join(self.output_dir, "output")
+
+        candidate_paths: List[str] = []
+        if self.use_enhanced_streams_catalog:
+            base, ext = os.path.splitext(streams_filename)
+            enhanced_name = f"{base}_enhanced{ext}" if ext else f"{streams_filename}_enhanced"
+            candidate_paths.append(os.path.join(output_root, enhanced_name))
+            candidate_paths.append(os.path.join(output_root, "streams_enhanced.json"))
+
+        candidate_paths.append(os.path.join(output_root, streams_filename))
+
+        catalog: Dict[str, str] = {}
+        for path in candidate_paths:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if isinstance(data, dict):
+                    catalog = data
+                    self.logger.info(
+                        f"Loaded stream catalog for backfill from {path}"
+                    )
+                    break
+                self.logger.warning(
+                    f"Stream catalog at {path} is not a dictionary. Skipping"
+                )
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to load stream catalog from {path}: {e}", exc_info=True
+                )
+
+        if not catalog and getattr(self, "streams_catalog", None):
+            catalog = self.streams_catalog
+            self.logger.info("Using in-memory streams catalog for backfill")
+
+        if not catalog:
+            self.logger.warning(
+                "Stream catalog unavailable; missing stream backfill will be skipped"
+            )
+
+        setattr(self, "_backfill_stream_catalog", catalog)
+        return catalog
+
+    @staticmethod
+    def _is_stream_missing(value: Any) -> bool:
+        """Return True when the provided stream value should be considered missing."""
+        if value is None:
+            return True
+        if isinstance(value, float) and pd.isna(value):
+            return True
+        text = str(value).strip()
+        return text == "" or text.lower() in {"nan", "none", "null", "na"}
+
+    def _missing_stream_mask(self, df: pd.DataFrame) -> pd.Series:
+        """Build a boolean mask for rows with missing stream assignments."""
+        return df["stream"].apply(self._is_stream_missing)
+
+    def _iter_session_dataframes(self) -> List[pd.DataFrame]:
+        """Return processed session DataFrames that can be inspected for streams."""
+        frames: List[pd.DataFrame] = []
+        for attr in [
+            "session_this_filtered_valid_cols",
+            "session_last_filtered_valid_cols_bva",
+            "session_last_filtered_valid_cols_lva",
+        ]:
+            df = getattr(self, attr, None)
+            if isinstance(df, pd.DataFrame):
+                frames.append(df)
+        return frames
+
+    def _build_streams_by_theatre(self) -> Dict[str, Set[str]]:
+        """Create a lookup of theatre name to known stream assignments."""
+        theatre_map: Dict[str, Set[str]] = defaultdict(set)
+        for df in self._iter_session_dataframes():
+            if df.empty or "theatre__name" not in df or "stream" not in df:
+                continue
+            for _, row in df.iterrows():
+                theatre = str(row.get("theatre__name", "")).strip()
+                if not theatre:
+                    continue
+                stream_value = row.get("stream", "")
+                if self._is_stream_missing(stream_value):
+                    continue
+                for stream_name in str(stream_value).split(";"):
+                    cleaned = stream_name.strip()
+                    if cleaned:
+                        theatre_map[theatre.lower()].add(cleaned)
+        return theatre_map
+
+    def _get_streams_for_theatre(self, theatre_name: str) -> Set[str]:
+        """Return known streams associated with a theatre."""
+        if not theatre_name:
+            return set()
+        if self._streams_by_theatre is None:
+            self._streams_by_theatre = self._build_streams_by_theatre()
+        return set(
+            self._streams_by_theatre.get(theatre_name.strip().lower(), set())
+        )
+
+    def _register_streams_for_theatre(self, theatre_name: str, streams: List[str]) -> None:
+        """Update the theatre to streams lookup when new assignments are created."""
+        if not theatre_name or not streams:
+            return
+        if self._streams_by_theatre is None:
+            self._streams_by_theatre = self._build_streams_by_theatre()
+        key = theatre_name.strip().lower()
+        theatre_set = self._streams_by_theatre.setdefault(key, set())
+        theatre_set.update(streams)
+
+    def _build_classification_messages(
+        self,
+        stream_candidates: List[str],
+        catalog: Dict[str, str],
+        title: str,
+        synopsis: str,
+    ) -> List[Any]:
+        """Construct system and human messages for stream classification."""
+        system_content = (
+            "You classify conference sessions into existing stream categories. "
+            "Choose between 1 and 3 stream names from the provided list that best match the session. "
+            "Respond with the stream names separated by semicolons on a single line using the exact names provided. "
+            "Do not add any additional text."
+        )
+
+        stream_lines = [f"{name}: {catalog.get(name, '')}" for name in stream_candidates]
+        human_content = (
+            "Streams:\n"
+            + "\n".join(stream_lines)
+            + "\n\n"
+            + f"Title: {title}\n"
+            + f"Synopsis: {synopsis}"
+        )
+
+        return [
+            SystemMessage(content=system_content),
+            HumanMessage(content=human_content),
+        ]
+
+    def _parse_stream_response(
+        self, response_text: str, available_streams: List[str]
+    ) -> List[str]:
+        """Parse the LLM response into canonical stream names."""
+        if not response_text:
+            return []
+
+        canonical_map = {name.lower(): name for name in available_streams}
+        parsed: List[str] = []
+
+        for fragment in re.split(r"[;\n]+", response_text):
+            candidate = fragment.strip().strip("-*•\"')")
+            if not candidate:
+                continue
+
+            lower_candidate = candidate.lower()
+            match = canonical_map.get(lower_candidate)
+
+            if not match:
+                simplified = re.sub(r"[^a-z0-9 &/+]", "", lower_candidate)
+                for stream_name in available_streams:
+                    if re.sub(r"[^a-z0-9 &/+]", "", stream_name.lower()) == simplified:
+                        match = stream_name
+                        break
+
+            if match and match not in parsed:
+                parsed.append(match)
+            if len(parsed) == 3:
+                break
+
+        return parsed
+
+    def _classify_streams_for_row(
+        self,
+        row: pd.Series,
+        stream_catalog: Dict[str, str],
+        candidate_streams: List[str],
+    ) -> List[str]:
+        """Call the language model to classify a session into streams."""
+        title = str(row.get("title", "")).strip()
+        synopsis = str(row.get("synopsis_stripped", "")).strip()
+
+        messages = self._build_classification_messages(
+            candidate_streams, stream_catalog, title, synopsis
+        )
+
+        try:
+            response = self.llm.invoke(messages)
+            raw_output: Optional[str] = None
+            if hasattr(response, "content"):
+                raw_output = response.content
+            elif isinstance(response, str):
+                raw_output = response
+            elif hasattr(response, "text"):
+                raw_output = response.text
+
+            if raw_output is None:
+                self.logger.warning(
+                    f"Empty response received when classifying session '{title}'"
+                )
+                return []
+
+            return self._parse_stream_response(raw_output.strip(), candidate_streams)
+
+        except Exception as e:
+            self.logger.error(
+                f"Language model classification failed for session '{title}': {e}",
+                exc_info=True,
+            )
+            return []
+
+    def _backup_file(self, file_path: str) -> Optional[str]:
+        """Create a timestamped backup of the supplied file."""
+        if not file_path or not os.path.exists(file_path):
+            self.logger.warning(f"Cannot back up missing file: {file_path}")
+            return None
+
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        backup_path = f"{file_path}.{timestamp}.bak"
+
+        try:
+            shutil.copy2(file_path, backup_path)
+            self.logger.info(f"Created backup {backup_path}")
+            return backup_path
+        except Exception as e:
+            self.logger.error(
+                f"Failed to create backup for {file_path}: {e}", exc_info=True
+            )
+            return None
+
+    def backfill_missing_streams(self) -> None:
+        """Backfill missing stream values using the language model."""
+        if not self.create_missing_streams:
+            self.logger.info(
+                "Stream backfill disabled via configuration (stream_processing.create_missing_streams)"
+            )
+            return
+
+        stream_catalog = self._load_stream_catalog_for_backfill()
+        if not stream_catalog:
+            return
+
+        if not self._ensure_language_model():
+            return
+
+        self._streams_by_theatre = self._build_streams_by_theatre()
+
+        dataframes = [
+            ("this_year", getattr(self, "session_this_filtered_valid_cols", None)),
+            (
+                "last_year_main",
+                getattr(self, "session_last_filtered_valid_cols_bva", None),
+            ),
+            (
+                "last_year_secondary",
+                getattr(self, "session_last_filtered_valid_cols_lva", None),
+            ),
+        ]
+
+        for label, df in dataframes:
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+
+            output_path = self.session_file_paths.get(label)
+            self.backfill_metrics["files_evaluated"] += 1
+
+            if not output_path:
+                self.logger.warning(
+                    f"No output path recorded for {label} sessions; skipping stream backfill"
+                )
+                continue
+
+            missing_mask = self._missing_stream_mask(df)
+            missing_indices = df.index[missing_mask].tolist()
+            missing_count = len(missing_indices)
+
+            if missing_count == 0:
+                self.logger.info(f"No missing streams detected in {label} sessions")
+                continue
+
+            self.backfill_metrics["total_missing_streams"] += missing_count
+            self._backup_file(output_path)
+
+            backfilled_count = 0
+
+            for idx in missing_indices:
+                row = df.loc[idx]
+                synopsis = str(row.get("synopsis_stripped", "")).strip()
+                if not synopsis:
+                    self.backfill_metrics["sessions_skipped_empty_synopsis"] += 1
+                    continue
+
+                theatre_name = str(row.get("theatre__name", "")).strip()
+                theatre_streams = list(self._get_streams_for_theatre(theatre_name))
+
+                candidate_streams = (
+                    sorted(theatre_streams)
+                    if theatre_streams
+                    else sorted(stream_catalog.keys())
+                )
+
+                if not candidate_streams:
+                    self.backfill_metrics["sessions_skipped_no_candidates"] += 1
+                    continue
+
+                # Limit prompt size to keep requests efficient
+                if len(candidate_streams) > 60:
+                    candidate_streams = candidate_streams[:60]
+
+                classifications = self._classify_streams_for_row(
+                    row, stream_catalog, candidate_streams
+                )
+
+                if not classifications:
+                    self.backfill_metrics["sessions_failed_llm"] += 1
+                    continue
+
+                normalized_streams = "; ".join(classifications)
+                df.at[idx, "stream"] = normalized_streams
+                backfilled_count += 1
+                self.backfill_metrics["sessions_backfilled"] += 1
+                self._register_streams_for_theatre(theatre_name, classifications)
+
+            if backfilled_count > 0:
+                df.to_csv(output_path, index=False)
+                self.backfill_metrics["files_modified"] += 1
+                self.logger.info(
+                    f"Backfilled {backfilled_count} sessions with missing streams in {label} ({output_path})"
+                )
+            else:
+                self.logger.info(
+                    f"No sessions backfilled in {label}; all candidates were skipped"
+                )
 
     @staticmethod
     def find_short_labels(input_set: Set[str]) -> List[str]:
@@ -468,15 +925,30 @@ class SessionProcessor:
     def save_processed_session_data(self) -> None:
         """Save processed session data to CSV files."""
         try:
-            # Define output paths
+            event_config = self.config.get("event", {})
+            main_event_name = event_config.get("main_event_name", "bva")
+            secondary_event_name = event_config.get("secondary_event_name", "lva")
+
+            this_year_filename = self.session_processed_files.get(
+                "this_year", "session_this_filtered_valid_cols.csv"
+            )
+            last_year_main_filename = self.session_processed_files.get(
+                "last_year_main",
+                f"session_last_filtered_valid_cols_{main_event_name}.csv",
+            )
+            last_year_secondary_filename = self.session_processed_files.get(
+                "last_year_secondary",
+                f"session_last_filtered_valid_cols_{secondary_event_name}.csv",
+            )
+
+            this_output_path = os.path.join(
+                self.output_dir, "output", this_year_filename
+            )
             bva_last_output_path = os.path.join(
-                self.output_dir, "output", "session_last_filtered_valid_cols_bva.csv"
+                self.output_dir, "output", last_year_main_filename
             )
             lva_last_output_path = os.path.join(
-                self.output_dir, "output", "session_last_filtered_valid_cols_lva.csv"
-            )
-            this_output_path = os.path.join(
-                self.output_dir, "output", "session_this_filtered_valid_cols.csv"
+                self.output_dir, "output", last_year_secondary_filename
             )
 
             # Save to CSV - NO NORMALIZATION
@@ -487,6 +959,14 @@ class SessionProcessor:
                 lva_last_output_path, index=False
             )
             self.session_this_filtered_valid_cols.to_csv(this_output_path, index=False)
+
+            self.session_file_paths.update(
+                {
+                    "this_year": this_output_path,
+                    "last_year_main": bva_last_output_path,
+                    "last_year_secondary": lva_last_output_path,
+                }
+            )
 
             self.logger.info(
                 f"Saved processed session data to {self.output_dir}/output/"
@@ -521,6 +1001,7 @@ class SessionProcessor:
         self.save_streams_catalog()
         self.expand_sponsor_abbreviations()
         self.save_processed_session_data()
+        self.backfill_missing_streams()
 
         self.logger.info("Session data processing workflow completed successfully")
 

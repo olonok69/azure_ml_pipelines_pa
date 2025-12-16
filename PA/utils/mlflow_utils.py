@@ -11,6 +11,7 @@ import yaml
 import json
 from typing import Dict, Any, Optional
 from datetime import datetime
+from mlflow.exceptions import MlflowException, RestException
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class MLflowManager:
         self.mlflow_tracking_uri = None
         self.run_id = None
         self.run = None
+        self.logging_disabled = False
         
     def verify_environment(self) -> bool:
         """
@@ -62,6 +64,43 @@ class MLflowManager:
         logger.info(f"Tracking URI: {self.mlflow_tracking_uri}")
         
         return True
+
+    def _handle_logging_failure(self, action: str, error: Exception) -> None:
+        """Disable further MLflow logging after a failure to avoid cascading errors."""
+        if self.logging_disabled:
+            return
+        logger.warning(
+            "Disabling MLflow logging after failure during %s: %s",
+            action,
+            error,
+        )
+        self.logging_disabled = True
+
+    def _log_param(self, name: str, value: Any) -> None:
+        """Safely log a parameter if MLflow logging is enabled."""
+        if self.logging_disabled:
+            return
+        try:
+            mlflow.log_param(name, value)
+        except (MlflowException, RestException, Exception) as exc:  # pragma: no cover - defensive
+            self._handle_logging_failure(f"log_param('{name}')", exc)
+
+    def _log_metric(self, name: str, value: Any) -> None:
+        """Safely log a metric if MLflow logging is enabled."""
+        if self.logging_disabled:
+            return
+        try:
+            mlflow.log_metric(name, value)
+        except (MlflowException, RestException, Exception) as exc:  # pragma: no cover - defensive
+            self._handle_logging_failure(f"log_metric('{name}')", exc)
+
+    def log_param(self, name: str, value: Any) -> None:
+        """Public helper for modules to log parameters via the manager."""
+        self._log_param(name, value)
+
+    def log_metric(self, name: str, value: Any) -> None:
+        """Public helper for modules to log metrics via the manager."""
+        self._log_metric(name, value)
     
     def start_run(self, config: Dict[str, Any]) -> str:
         """
@@ -85,21 +124,22 @@ class MLflowManager:
         # Start the run
         self.run = mlflow.start_run(run_name=run_name)
         self.run_id = self.run.info.run_id
+        self.logging_disabled = False
         
         # Log configuration as parameters (RESTORED from old version)
         logger.info("Logging configuration parameters to MLflow")
         self.log_config_as_params(config)
         
         # Log additional metadata
-        mlflow.log_param("pipeline_type", "recommendation_pipeline")
-        mlflow.log_param("event_name", event_name)
-        mlflow.log_param("timestamp", timestamp)
-        mlflow.log_param("pipeline_version", "enhanced")
+        self._log_param("pipeline_type", "recommendation_pipeline")
+        self._log_param("event_name", event_name)
+        self._log_param("timestamp", timestamp)
+        self._log_param("pipeline_version", "enhanced")
         
         # Determine processing mode
         main_event_name = event_config.get("main_event_name", "").lower()
         processing_mode = "veterinary" if main_event_name in ["bva", "veterinary", "vet"] else "generic"
-        mlflow.log_param("processing_mode", processing_mode)
+        self._log_param("processing_mode", processing_mode)
         
         # Try to log the configuration file as an artifact (RESTORED from old version)
         try:
@@ -142,19 +182,13 @@ class MLflowManager:
             elif isinstance(value, (list, tuple)):
                 # For lists/tuples, convert to string representation
                 if len(str(value)) <= 250:  # MLflow param value limit
-                    try:
-                        mlflow.log_param(param_name, str(value))
-                        logger.debug(f"Logged parameter: {param_name} = {value}")
-                    except Exception as e:
-                        logger.warning(f"Could not log parameter {param_name}: {e}")
+                    self._log_param(param_name, str(value))
+                    logger.debug(f"Logged parameter: {param_name} = {value}")
             else:
                 # For scalar values, log directly
                 if value is not None and len(str(value)) <= 250:
-                    try:
-                        mlflow.log_param(param_name, value)
-                        logger.debug(f"Logged parameter: {param_name} = {value}")
-                    except Exception as e:
-                        logger.warning(f"Could not log parameter {param_name}: {e}")
+                    self._log_param(param_name, value)
+                    logger.debug(f"Logged parameter: {param_name} = {value}")
     
     def log_config_params(self, config: Dict[str, Any]) -> None:
         """
@@ -182,27 +216,18 @@ class MLflowManager:
             if isinstance(value, dict):
                 # For nested dictionaries, convert to JSON string
                 if len(str(value)) <= 250:  # MLflow param value limit
-                    try:
-                        mlflow.log_param(param_name, json.dumps(value))
-                        logger.debug(f"Logged parameter: {param_name} = {value}")
-                    except Exception as e:
-                        logger.warning(f"Could not log parameter {param_name}: {e}")
+                    self._log_param(param_name, json.dumps(value))
+                    logger.debug(f"Logged parameter: {param_name} = {value}")
             elif isinstance(value, (list, tuple)):
                 # For lists/tuples, convert to string representation
                 if len(str(value)) <= 250:  # MLflow param value limit
-                    try:
-                        mlflow.log_param(param_name, str(value))
-                        logger.debug(f"Logged parameter: {param_name} = {value}")
-                    except Exception as e:
-                        logger.warning(f"Could not log parameter {param_name}: {e}")
+                    self._log_param(param_name, str(value))
+                    logger.debug(f"Logged parameter: {param_name} = {value}")
             else:
                 # For scalar values, log directly
                 if value is not None and len(str(value)) <= 250:
-                    try:
-                        mlflow.log_param(param_name, value)
-                        logger.debug(f"Logged parameter: {param_name} = {value}")
-                    except Exception as e:
-                        logger.warning(f"Could not log parameter {param_name}: {e}")
+                    self._log_param(param_name, value)
+                    logger.debug(f"Logged parameter: {param_name} = {value}")
     
     def _remove_sensitive_info(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -246,11 +271,8 @@ class MLflowManager:
             full_name = f"{prefix}_{metric_name}" if prefix else metric_name
             
             if isinstance(metric_value, (int, float)):
-                try:
-                    mlflow.log_metric(full_name, metric_value)
-                    logger.debug(f"Logged metric: {full_name} = {metric_value}")
-                except Exception as e:
-                    logger.warning(f"Could not log metric {full_name}: {e}")
+                self._log_metric(full_name, metric_value)
+                logger.debug(f"Logged metric: {full_name} = {metric_value}")
     
     def log_summary_metrics(self, processors: Dict[str, Any]) -> None:
         """
@@ -351,6 +373,13 @@ class MLflowManager:
             
             if hasattr(session, 'streams'):
                 metrics['session_unique_stream_categories'] = len(session.streams)
+
+            if hasattr(session, 'backfill_metrics'):
+                backfill = session.backfill_metrics
+                metrics['session_missing_streams_detected'] = backfill.get('total_missing_streams', 0)
+                metrics['session_missing_streams_backfilled'] = backfill.get('sessions_backfilled', 0)
+                metrics['session_missing_streams_skipped_synopsis'] = backfill.get('sessions_skipped_empty_synopsis', 0)
+                metrics['session_missing_streams_llm_failures'] = backfill.get('sessions_failed_llm', 0)
         
         # Neo4j Visitor processor metrics (Step 4)
         if "neo4j_visitor_processor" in processors:
@@ -505,11 +534,11 @@ class MLflowManager:
                 
                 # Log processing time
                 if 'processing_time_seconds' in summary:
-                    mlflow.log_metric('total_processing_time_seconds', summary['processing_time_seconds'])
+                    self._log_metric('total_processing_time_seconds', summary['processing_time_seconds'])
                 
                 # Log step counts
                 if 'steps_completed' in summary:
-                    mlflow.log_metric('steps_completed', len(summary['steps_completed']))
+                    self._log_metric('steps_completed', len(summary['steps_completed']))
                 
                 # Extract metrics from each section of the summary
                 # This ensures we capture any metrics that might have been missed
@@ -549,11 +578,8 @@ class MLflowManager:
                     flattened = flatten_dict(summary[section], parent_key=f'summary_{section}')
                     for metric_name, metric_value in flattened.items():
                         if isinstance(metric_value, (int, float)) and not metric_name.endswith('_skipped'):
-                            try:
-                                mlflow.log_metric(metric_name, metric_value)
-                                logger.debug(f"Logged summary metric: {metric_name} = {metric_value}")
-                            except Exception as e:
-                                logger.debug(f"Could not log summary metric {metric_name}: {e}")
+                            self._log_metric(metric_name, metric_value)
+                            logger.debug(f"Logged summary metric: {metric_name} = {metric_value}")
         
         except Exception as e:
             logger.warning(f"Error logging summary section metrics: {e}")
@@ -570,3 +596,5 @@ class MLflowManager:
             logger.info(f"MLflow run ended with status: {status}")
         except Exception as e:
             logger.warning(f"Could not end MLflow run: {e}")
+        finally:
+            self.logging_disabled = True

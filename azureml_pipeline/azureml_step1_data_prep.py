@@ -1010,6 +1010,20 @@ def main(args):
         raise
 
 
+def _bool_arg(value: Optional[str]) -> bool:
+    """Convert an optional CLI value to boolean with support for flags."""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    value_str = str(value).strip().lower()
+    if value_str in {"true", "1", "yes", "y"}:
+        return True
+    if value_str in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected for incremental flag")
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Azure ML Data Preparation Step")
@@ -1029,8 +1043,11 @@ def parse_args():
     
     parser.add_argument(
         "--incremental",
-        action="store_true",
-        help="Run incremental processing (only new data)"
+        nargs="?",
+        const=True,
+        default=False,
+        type=_bool_arg,
+        help="Run incremental processing (only new data). Accepts true/false."
     )
     
     parser.add_argument(

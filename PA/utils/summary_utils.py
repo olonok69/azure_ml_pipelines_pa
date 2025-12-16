@@ -167,6 +167,9 @@ def generate_and_save_summary(processors, skip_neo4j=False):
             "unique_streams": len(session_processor.unique_streams) if hasattr(session_processor, "unique_streams") else 0,
             "stream_categories": list(session_processor.streams_catalog.keys()) if session_processor.streams_catalog else [],
         }
+
+        if hasattr(session_processor, "backfill_metrics"):
+            session_summary["missing_stream_backfill"] = session_processor.backfill_metrics
         summary["session"] = session_summary
 
     # Add Neo4j statistics if available and Neo4j processing wasn't skipped
@@ -479,32 +482,44 @@ def print_summary_statistics(summary, skip_neo4j, reg_processor=None):
     # Print session recommendation summary
     if "session_recommendation" in summary:
         rec_summary = summary["session_recommendation"]
+        total_visitors_processed = rec_summary.get("total_visitors_processed", 0)
+        visitors_with_recommendations = rec_summary.get(
+            "visitors_with_recommendations", 0
+        )
+        total_recommendations_generated = rec_summary.get(
+            "total_recommendations_generated", 0
+        )
+        unique_recommended_sessions = rec_summary.get(
+            "unique_recommended_sessions", 0
+        )
+        errors_count = rec_summary.get("errors", 0)
+
         logger.info(
-            f"Total visitors processed for recommendations: {rec_summary['total_visitors_processed']}"
+            f"Total visitors processed for recommendations: {total_visitors_processed}"
         )
         logger.info(
-            f"Visitors with successful recommendations: {rec_summary['visitors_with_recommendations']}"
+            f"Visitors with successful recommendations: {visitors_with_recommendations}"
         )
         logger.info(
-            f"Total recommendations generated: {rec_summary['total_recommendations_generated']}"
+            f"Total recommendations generated: {total_recommendations_generated}"
         )
         logger.info(
-            f"Unique sessions recommended: {rec_summary['unique_recommended_sessions']}"
+            f"Unique sessions recommended: {unique_recommended_sessions}"
         )
-        if rec_summary.get("errors", 0) > 0:
-            logger.info(f"Errors encountered: {rec_summary['errors']}")
+        if errors_count > 0:
+            logger.info(f"Errors encountered: {errors_count}")
 
         print("\nSession Recommendation Summary:")
-        print(f"Total visitors processed: {rec_summary['total_visitors_processed']}")
+        print(f"Total visitors processed: {total_visitors_processed}")
         print(
-            f"Visitors with successful recommendations: {rec_summary['visitors_with_recommendations']}"
+            f"Visitors with successful recommendations: {visitors_with_recommendations}"
         )
         print(
-            f"Total recommendations generated: {rec_summary['total_recommendations_generated']}"
+            f"Total recommendations generated: {total_recommendations_generated}"
         )
-        print(f"Unique sessions recommended: {rec_summary['unique_recommended_sessions']}")
-        if rec_summary.get("errors", 0) > 0:
-            print(f"Errors encountered: {rec_summary['errors']}")
+        print(f"Unique sessions recommended: {unique_recommended_sessions}")
+        if errors_count > 0:
+            print(f"Errors encountered: {errors_count}")
 
     # Print summary location
     print(f"\n📄 Detailed summary saved to: logs/processing_summary.json")

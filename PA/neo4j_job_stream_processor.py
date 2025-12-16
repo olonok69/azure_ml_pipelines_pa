@@ -19,6 +19,8 @@ from neo4j import GraphDatabase
 from dotenv import load_dotenv
 import inspect
 
+from utils.neo4j_utils import resolve_neo4j_credentials
+
 
 class Neo4jJobStreamProcessor:
     """
@@ -47,15 +49,14 @@ class Neo4jJobStreamProcessor:
 
         # Load the environment variables to get Neo4j credentials
         load_dotenv(config["env_file"])
-        self.uri = os.getenv("NEO4J_URI")
-        self.username = os.getenv("NEO4J_USERNAME")
-        self.password = os.getenv("NEO4J_PASSWORD")
-
-        if not self.uri or not self.username or not self.password:
-            self.logger.error(
-                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Missing Neo4j credentials in .env file"
-            )
-            raise ValueError("Missing Neo4j credentials in .env file")
+        credentials = resolve_neo4j_credentials(config, logger=self.logger)
+        self.uri = credentials["uri"]
+        self.username = credentials["username"]
+        self.password = credentials["password"]
+        self.neo4j_environment = credentials["environment"]
+        self.logger.info(
+            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Using Neo4j environment: {self.neo4j_environment}"
+        )
 
         # ENHANCED: Get configuration values with fallbacks for backward compatibility
         self.neo4j_config = config.get("neo4j", {})
@@ -203,13 +204,15 @@ class Neo4jJobStreamProcessor:
         # Apply any additional mapping rules here if needed
         mapping_applied = False
         
-        # Example mapping rules (commented out but structure preserved):
-        # if normalized_name == "geriatric medicine":
-        #     normalized_name = "internal medicine"
-        #     mapping_applied = True
-        # elif normalized_name == "welfare":
-        #     normalized_name = "animal welfare"
-        #     mapping_applied = True
+        # Known synonyms -> canonical names (based on streams.json)
+        lower_name = normalized_name.lower()
+        synonyms = {
+            "emergency and critical care (ecc)": "Emergency Medicine",
+            "ecc": "Emergency Medicine",
+        }
+        if lower_name in synonyms:
+            normalized_name = synonyms[lower_name]
+            mapping_applied = True
 
         return normalized_name, mapping_applied
 

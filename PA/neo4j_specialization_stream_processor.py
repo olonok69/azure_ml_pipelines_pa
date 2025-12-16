@@ -1,33 +1,18 @@
-#!/usr/bin/env python3
-"""
-Enhanced Neo4j Specialization Stream Processor with Skip Support
-
-A generic class to process specialization to stream mappings and create relationships in Neo4j.
-This class is responsible for creating relationships between visitor nodes and
-stream nodes based on practice specializations.
-
-ENHANCED: Supports skipping processing for specific shows via configuration.
-GENERIC: Supports configurable node labels, relationship names, field names, and show filtering.
-Compatible with both BVA and ECOMM show configurations.
-"""
-
 import logging
 import os
-import pandas as pd
 import json
+import pandas as pd
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 import inspect
 
+from utils.neo4j_utils import resolve_neo4j_credentials
+
 
 class Neo4jSpecializationStreamProcessor:
     """
-    Enhanced Neo4j Specialization Stream Processor with configurable skip support.
-    
-    NEW FEATURES:
-    - Can skip processing entirely based on config (for ECOMM/TFM shows)
-    - Enhanced configuration validation
-    - Better error handling and logging
+    A class to process specialization to stream relationships in Neo4j.
+    ENHANCED: Supports different mappings for different visitor types.
     """
 
     def __init__(self, config):
@@ -39,32 +24,35 @@ class Neo4jSpecializationStreamProcessor:
         """
         self.logger = logging.getLogger(__name__)
         self.logger.info(
-            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Initializing Enhanced Neo4j Specialization Stream Processor"
+            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Initializing Neo4j Specialization Stream Processor"
+        )
+        self.config = config
+        self.output_dir = config["output_dir"]
+        self.input_dir = os.path.join(self.output_dir, "output")
+
+        # Load environment variables
+        load_dotenv(config.get("env_file", "keys/.env"))
+
+        # Neo4j connection details
+        credentials = resolve_neo4j_credentials(config, logger=self.logger)
+        self.uri = credentials["uri"]
+        self.username = credentials["username"]
+        self.password = credentials["password"]
+        self.neo4j_environment = credentials["environment"]
+        self.logger.info(
+            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Using Neo4j environment: {self.neo4j_environment}"
         )
 
-        self.config = config
-        self.input_dir = config["output_dir"]
+        # Get configuration for specialization stream mapping
+        neo4j_config = config.get("neo4j", {})
+        self.show_name = neo4j_config.get("show_name", None)
+        self.node_labels = neo4j_config.get("node_labels", {})
+        self.relationships = neo4j_config.get("relationships", {})
+        self.specialization_stream_mapping_config = neo4j_config.get(
+            "specialization_stream_mapping", {}
+        )
 
-        # Load the environment variables to get Neo4j credentials
-        load_dotenv(config["env_file"])
-        self.uri = os.getenv("NEO4J_URI")
-        self.username = os.getenv("NEO4J_USERNAME")
-        self.password = os.getenv("NEO4J_PASSWORD")
-
-        if not self.uri or not self.username or not self.password:
-            self.logger.error(
-                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Missing Neo4j credentials in .env file"
-            )
-            raise ValueError("Missing Neo4j credentials in .env file")
-
-        # ENHANCED: Get configuration values with fallbacks for backward compatibility
-        self.neo4j_config = config.get("neo4j", {})
-        self.show_name = self.neo4j_config.get("show_name", None)  # None = backward compatibility mode
-        self.node_labels = self.neo4j_config.get("node_labels", {})
-        self.relationships = self.neo4j_config.get("relationships", {})
-        self.specialization_stream_mapping_config = self.neo4j_config.get("specialization_stream_mapping", {})
-        
-        # NEW: Check if specialization stream processing is enabled for this show
+        # Check if specialization stream processing is enabled for this show
         self.specialization_stream_enabled = self.specialization_stream_mapping_config.get("enabled", True)
         
         # Get configuration values for specialization mapping
@@ -89,28 +77,44 @@ class Neo4jSpecializationStreamProcessor:
         self.specialization_mapping_file = self.specialization_stream_mapping_config.get(
             "file", "spezialization_to_stream.csv"
         )
-        self.specialization_map = self.specialization_stream_mapping_config.get(
-            "specialization_map", {}
+        
+        # ENHANCED: Get visitor-type-specific mappings
+        self.specialization_map_this_year = self.specialization_stream_mapping_config.get(
+            "specialization_map_this_year", {}
+        )
+        self.specialization_map_last_year_bva = self.specialization_stream_mapping_config.get(
+            "specialization_map_last_year_bva", {}
+        )
+        self.specialization_map_last_year_lva = self.specialization_stream_mapping_config.get(
+            "specialization_map_last_year_lva", {}
         )
         
-        # Fallback to default mapping if not configured
-        if not self.specialization_map:
-            self.specialization_map = {
-                "Wildlife": "Other",
-                "Small Animal": "Companion Animal",
-                "Mixed": "Other",
-                "Dairy": "Farm",
-                "Poultry": "Farm",
-                "Cattle": "Farm",
-                "Pigs": "Farm",
-                "Sheep": "Farm",
-            }
+        # Fallback to old config for backward compatibility
+        if not self.specialization_map_this_year and not self.specialization_map_last_year_bva:
+            old_map = self.specialization_stream_mapping_config.get("specialization_map", {})
+            if old_map:
+                self.logger.warning(
+                    "Using deprecated 'specialization_map' config. Please update to use visitor-type-specific mappings."
+                )
+                self.specialization_map_this_year = old_map
+                self.specialization_map_last_year_bva = old_map
+                self.specialization_map_last_year_lva = old_map
+
+        # Progress logging interval for created relationships
+        self.progress_log_interval = self.specialization_stream_mapping_config.get(
+            "progress_log_interval", 10000
+        )
 
         # Initialize statistics
         self.statistics = {
             "initial_count": 0,
             "final_count": 0,
-            "visitor_nodes_processed": {"this_year": 0, "last_year_bva": 0, "last_year_lva": 0},
+            # Track by actual node labels (lowercased) to match aggregation keys
+            "visitor_nodes_processed": {
+                self.visitor_this_year_label.lower(): 0,
+                self.visitor_last_year_bva_label.lower(): 0,
+                self.visitor_last_year_lva_label.lower(): 0,
+            },
             "specializations_processed": 0,
             "specializations_mapped": 0,
             "stream_matches_found": 0,
@@ -148,8 +152,6 @@ class Neo4jSpecializationStreamProcessor:
         """
         Determine if processing should be skipped for this configuration.
         
-        NEW: Checks configuration to determine if specialization stream processing should be skipped.
-        
         Returns:
             tuple: (should_skip: bool, reason: str)
         """
@@ -159,7 +161,8 @@ class Neo4jSpecializationStreamProcessor:
         
         # Check if mapping file exists - try multiple locations
         possible_paths = [
-            os.path.join(self.input_dir, self.specialization_mapping_file),  # output_dir/file
+            os.path.join(self.input_dir, self.specialization_mapping_file),  # output_dir/output/file
+            os.path.join(self.output_dir, self.specialization_mapping_file),  # align with job mapping search path
             self.specialization_mapping_file,  # current directory
             os.path.join("data", "bva", self.specialization_mapping_file),  # data/bva/file
         ]
@@ -173,24 +176,21 @@ class Neo4jSpecializationStreamProcessor:
     def load_mappings(self):
         """
         Load the specialization mappings from CSV files.
-        GENERIC: Uses configurable file paths and mapping configuration.
-
+        
         Returns:
-            tuple: (map_specialization, specialization_stream_mapping)
+            dict: Mapping from specializations to streams
         """
         self.logger.info(
             f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Loading specialization mappings"
         )
 
         try:
-            # Use the configured specialization mapping
-            map_specialization = self.specialization_map
-
             # Load specialization to stream mapping from configured file - try multiple locations
             possible_paths = [
-                os.path.join(self.input_dir, self.specialization_mapping_file),  # output_dir/file
-                self.specialization_mapping_file,  # current directory
-                os.path.join("data", "bva", self.specialization_mapping_file),  # data/bva/file
+                os.path.join(self.input_dir, self.specialization_mapping_file),
+                os.path.join(self.output_dir, self.specialization_mapping_file),
+                self.specialization_mapping_file,
+                os.path.join("data", "bva", self.specialization_mapping_file),
             ]
             
             specialization_stream_file = None
@@ -219,7 +219,7 @@ class Neo4jSpecializationStreamProcessor:
                 f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Loaded mapping for {len(specialization_stream_mapping)} specializations"
             )
 
-            return map_specialization, specialization_stream_mapping
+            return specialization_stream_mapping
         except Exception as e:
             self.logger.error(
                 f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Error loading specialization mappings: {str(e)}"
@@ -229,14 +229,12 @@ class Neo4jSpecializationStreamProcessor:
     def _count_relationships(self, session):
         """
         Count the total number of specialization_to_stream relationships.
-        GENERIC: Uses configurable relationship and node labels with show filtering.
         """
         query = f"""
         MATCH (:{self.visitor_this_year_label})-[r:{self.relationship_name}]->(:{self.stream_label})
         RETURN COUNT(r) AS count
         """
         
-        # Add show filtering if configured
         if self.show_name:
             query = f"""
             MATCH (v:{self.visitor_this_year_label})-[r:{self.relationship_name}]->(s:{self.stream_label})
@@ -249,23 +247,41 @@ class Neo4jSpecializationStreamProcessor:
             
         return result.single()["count"]
 
+    def _normalize_stream_name(self, stream_name):
+        """
+        Normalize stream names to match canonical Stream nodes in Neo4j.
+        Currently maps known synonyms that aren't present as-is in the DB.
+
+        Args:
+            stream_name (str): Stream name from mapping file
+
+        Returns:
+            tuple[str, bool]: (normalized_name, was_mapped)
+        """
+        if not stream_name:
+            return stream_name, False
+
+        original = stream_name
+        name_l = stream_name.strip().lower()
+
+        # Known synonyms -> canonical names (based on streams.json)
+        synonyms = {
+            "emergency and critical care (ecc)": "Emergency Medicine",
+            "ecc": "Emergency Medicine",
+        }
+
+        if name_l in synonyms:
+            return synonyms[name_l], True
+
+        # Default: return original (trimmed) without change
+        return original.strip(), False
+
     def process_visitor_specializations(
         self, tx, node_label, specialization_field, map_specialization, specialization_stream_mapping, create_only_new
     ):
         """
         Process specializations for a specific visitor node type.
-        GENERIC: Supports configurable node labels, field names, and show filtering.
-
-        Args:
-            tx: Neo4j transaction
-            node_label (str): Label of the visitor nodes to process
-            specialization_field (str): Field name containing specializations
-            map_specialization (dict): Mapping for specialization names
-            specialization_stream_mapping (dict): Mapping from specializations to streams
-            create_only_new (bool): Whether to only create new relationships
-
-        Returns:
-            dict: Statistics for this visitor type processing
+        ENHANCED: Uses visitor-type-specific mappings.
         """
         stats = {
             "visitor_nodes_processed": {node_label.lower(): 0},
@@ -277,7 +293,7 @@ class Neo4jSpecializationStreamProcessor:
             "relationships_not_found": 0,
         }
 
-        # GENERIC: Build query with show filtering if configured
+        # Build query with show filtering if configured
         additional_filter = ""
         if create_only_new:
             additional_filter = ' AND (v.has_recommendation IS NULL OR v.has_recommendation = "0")'
@@ -311,7 +327,7 @@ class Neo4jSpecializationStreamProcessor:
 
             stats["visitor_nodes_processed"][visitor_type_key] += 1
 
-            # Skip if BadgeId or Email is not available (needed for identification)
+            # Skip if BadgeId or Email is not available
             if not badge_id or not email:
                 continue
 
@@ -326,10 +342,13 @@ class Neo4jSpecializationStreamProcessor:
             for spec in specializations:
                 spec = spec.strip()
 
-                # Map specialization if needed
+                # Map specialization if needed (using visitor-type-specific mapping)
                 if spec in map_specialization:
                     mapped_spec = map_specialization[spec]
                     stats["specializations_mapped"] += 1
+                    self.logger.debug(
+                        f"Mapping '{spec}' to '{mapped_spec}' for {node_label}"
+                    )
                 else:
                     mapped_spec = spec
 
@@ -348,6 +367,13 @@ class Neo4jSpecializationStreamProcessor:
                             if self.show_name:
                                 stream_search_filter = ' AND s.show = $show_name'
 
+                            # Normalize known synonyms to canonical stream names
+                            normalized_stream_name, mapped = self._normalize_stream_name(stream_name)
+                            # if mapped:
+                            #     self.logger.info(
+                            #         f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Stream name normalization: '{stream_name}' → '{normalized_stream_name}'"
+                            #     )
+
                             stream_query = f"""
                             MATCH (s:{self.stream_label})
                             WHERE LOWER(s.stream) = LOWER($stream_name){stream_search_filter}
@@ -355,7 +381,7 @@ class Neo4jSpecializationStreamProcessor:
                             LIMIT 1
                             """
 
-                            stream_params = {"stream_name": stream_name}
+                            stream_params = {"stream_name": normalized_stream_name}
                             if self.show_name:
                                 stream_params["show_name"] = self.show_name
 
@@ -387,11 +413,12 @@ class Neo4jSpecializationStreamProcessor:
                                 WITH v, s
                                 WHERE NOT exists((v)-[:{self.relationship_name}]->(s))
                                 
-                                CREATE (v)-[r:{self.relationship_name} {{created_by: 'specialization_processor'}}]->(s)
-                                RETURN count(r) AS created
+                                CREATE (v)-[r:{self.relationship_name}]->(s)
+                                SET r.created_by = $created_by
+                                RETURN r
                                 """
                             else:
-                                # Create using MERGE
+                                # Always create (might create duplicates)
                                 relationship_query = f"""
                                 MATCH (v:{node_label})
                                 WHERE v.BadgeId = $badge_id AND v.Email = $email{visitor_show_filter}
@@ -399,45 +426,52 @@ class Neo4jSpecializationStreamProcessor:
                                 MATCH (s:{self.stream_label})
                                 WHERE LOWER(s.stream) = LOWER($actual_stream_name){stream_show_filter}
                                 
-                                MERGE (v)-[r:{self.relationship_name} {{created_by: 'specialization_processor'}}]->(s)
-                                RETURN count(r) AS created
+                                CREATE (v)-[r:{self.relationship_name}]->(s)
+                                SET r.created_by = $created_by
+                                RETURN r
                                 """
 
                             rel_params = {
                                 "badge_id": badge_id,
                                 "email": email,
-                                "actual_stream_name": actual_stream_name
+                                "actual_stream_name": actual_stream_name,
+                                "created_by": "specialization_processor"
                             }
                             if self.show_name:
                                 rel_params["show_name"] = self.show_name
 
                             result = tx.run(relationship_query, **rel_params)
-                            created = result.single()["created"]
 
-                            if created > 0:
-                                stats["relationships_created"] += created
+                            if result.single():
+                                stats["relationships_created"] += 1
+                                # Periodic progress logging every N created relationships
+                                if (
+                                    self.progress_log_interval
+                                    and stats["relationships_created"] % self.progress_log_interval == 0
+                                ):
+                                    self.logger.info(
+                                        f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Created {stats['relationships_created']:,} relationships so far for {node_label}"
+                                    )
                             else:
                                 stats["relationships_skipped"] += 1
+                else:
+                    # Log warning if mapped specialization not found
+                    if mapped_spec != spec:
+                        self.logger.warning(
+                            f"Mapped specialization '{mapped_spec}' (from '{spec}') not found in specialization_stream_mapping"
+                        )
 
         return stats
 
     def create_specialization_stream_relationships(
-        self, map_specialization, specialization_stream_mapping, create_only_new=True
+        self, specialization_stream_mapping, create_only_new=True
     ):
         """
-        Create relationships between visitor nodes and stream nodes based on specializations.
-        GENERIC: Supports configurable node labels, relationship names, and show filtering.
-
-        Args:
-            map_specialization (dict): Dictionary mapping old specialization names to new ones.
-            specialization_stream_mapping (dict): Dictionary mapping specializations to streams.
-            create_only_new (bool): If True, only create relationships that don't exist.
-
-        Returns:
-            dict: Statistics about the relationship creation process.
+        Create relationships between visitors and streams based on specializations.
+        ENHANCED: Uses visitor-type-specific mappings.
         """
         self.logger.info(
-            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Creating specialization to stream relationships (generic mode)"
+            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Creating specialization to stream relationships with visitor-type-specific mappings"
         )
 
         driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
@@ -450,31 +484,35 @@ class Neo4jSpecializationStreamProcessor:
                 f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Initial relationship count: {initial_count}"
             )
 
-        # Process different visitor types
+        # Process different visitor types with their specific mappings
         visitor_types = [
             {
                 "node_label": self.visitor_this_year_label,
                 "specialization_field": self.specialization_field_this_year,
+                "map_specialization": self.specialization_map_this_year,
             },
             {
                 "node_label": self.visitor_last_year_bva_label,
                 "specialization_field": self.specialization_field_bva,
+                "map_specialization": self.specialization_map_last_year_bva,
             },
             {
                 "node_label": self.visitor_last_year_lva_label,
                 "specialization_field": self.specialization_field_lva,
+                "map_specialization": self.specialization_map_last_year_lva,
             },
         ]
 
         try:
             with driver.session() as session:
-                # Process each visitor type
+                # Process each visitor type with its specific mapping
                 for visitor_type in visitor_types:
                     node_label = visitor_type["node_label"]
                     specialization_field = visitor_type["specialization_field"]
+                    map_specialization = visitor_type["map_specialization"]
 
                     self.logger.info(
-                        f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Processing {node_label} with field '{specialization_field}'"
+                        f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Processing {node_label} with field '{specialization_field}' and {len(map_specialization)} mappings"
                     )
 
                     # Process in a transaction
@@ -487,19 +525,54 @@ class Neo4jSpecializationStreamProcessor:
                         create_only_new,
                     )
 
-                    # Merge statistics
-                    for key, value in visitor_stats.items():
-                        if key == "visitor_nodes_processed":
-                            self.statistics[key].update(value)
-                        else:
-                            self.statistics[key] += value
+                    # Update overall statistics
+                    for key in visitor_stats["visitor_nodes_processed"]:
+                        # Ensure key exists (handles custom labels)
+                        if key not in self.statistics["visitor_nodes_processed"]:
+                            self.statistics["visitor_nodes_processed"][key] = 0
+                        self.statistics["visitor_nodes_processed"][key] += visitor_stats["visitor_nodes_processed"].get(key, 0)
 
-                # Count final relationships
+                    self.statistics["specializations_processed"] += visitor_stats[
+                        "specializations_processed"
+                    ]
+                    self.statistics["specializations_mapped"] += visitor_stats[
+                        "specializations_mapped"
+                    ]
+                    self.statistics["stream_matches_found"] += visitor_stats[
+                        "stream_matches_found"
+                    ]
+                    self.statistics["relationships_created"] += visitor_stats[
+                        "relationships_created"
+                    ]
+                    self.statistics["relationships_skipped"] += visitor_stats[
+                        "relationships_skipped"
+                    ]
+                    self.statistics["relationships_not_found"] += visitor_stats[
+                        "relationships_not_found"
+                    ]
+
+                    self.logger.info(
+                        f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Processed {node_label}: "
+                        f"Created {visitor_stats['relationships_created']}, "
+                        f"Skipped {visitor_stats['relationships_skipped']}, "
+                        f"Not found {visitor_stats['relationships_not_found']}"
+                    )
+
+                # Count the final relationships
                 final_count = self._count_relationships(session)
                 self.statistics["final_count"] = final_count
+                self.statistics["total_relationships_created"] = (
+                    final_count - initial_count
+                )
+                self.statistics["total_relationships_skipped"] = self.statistics[
+                    "relationships_skipped"
+                ]
 
                 self.logger.info(
                     f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Final relationship count: {final_count}"
+                )
+                self.logger.info(
+                    f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Total new relationships created: {self.statistics['total_relationships_created']}"
                 )
 
         except Exception as e:
@@ -510,8 +583,10 @@ class Neo4jSpecializationStreamProcessor:
         finally:
             driver.close()
 
+        return self.statistics
+
     def print_reconciliation_report(self):
-        """Print a detailed reconciliation report."""
+        """Print a reconciliation report of the specialization stream processing."""
         self.logger.info(
             f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - === SPECIALIZATION STREAM PROCESSOR RECONCILIATION REPORT ==="
         )
@@ -560,50 +635,69 @@ class Neo4jSpecializationStreamProcessor:
     def process(self, create_only_new=True):
         """
         Process specialization to stream mappings and create relationships in Neo4j.
-        ENHANCED: Added skip logic for shows that don't need specialization stream processing.
-
-        Args:
-            create_only_new (bool): If True, only create relationships that don't exist.
         """
-        self.logger.info(
-            f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Starting Enhanced Neo4j specialization to stream relationship processing"
-        )
+        self.logger.info("Starting specialization stream processing workflow")
 
-        # NEW: Check if processing should be skipped
+        # Check if processing should be skipped
         should_skip, skip_reason = self.should_skip_processing()
-        
         if should_skip:
-            self.logger.info(
-                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Skipping specialization stream processing: {skip_reason}"
-            )
             self.statistics["processing_skipped"] = True
             self.statistics["skip_reason"] = skip_reason
-            return
+            self.logger.warning(f"Skipping processing: {skip_reason}")
+            self.print_reconciliation_report()
+            return self.statistics
 
-        # Test the connection first
+        # Test Neo4j connection
         if not self._test_connection():
-            self.logger.error(
-                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Cannot proceed with Neo4j processing due to connection failure"
-            )
-            return
+            self.logger.error("Failed to connect to Neo4j. Aborting.")
+            return None
 
         try:
-            # Load the mappings
-            map_specialization, specialization_stream_mapping = self.load_mappings()
-
-            # Create the relationships
+            # Load mappings
+            specialization_stream_mapping = self.load_mappings()
+            
+            # Create relationships
             self.create_specialization_stream_relationships(
-                map_specialization, specialization_stream_mapping, create_only_new
+                specialization_stream_mapping, create_only_new
             )
 
-            # Print detailed reconciliation report
+            # Print reconciliation report
             self.print_reconciliation_report()
 
-            self.logger.info(
-                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Enhanced Neo4j specialization to stream relationship processing completed"
-            )
+            return self.statistics
+
         except Exception as e:
             self.logger.error(
-                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Error in specialization to stream relationship processing: {str(e)}"
+                f"Specialization stream processing failed: {e}", exc_info=True
             )
-            raise
+            return None
+
+
+def main():
+    """Main function for testing the specialization stream processor."""
+    import sys
+    sys.path.insert(0, os.getcwd())
+    
+    from utils.config_utils import load_config
+    from utils.logging_utils import setup_logging
+
+    # Setup logging
+    logger = setup_logging(log_file="logs/neo4j_specialization_stream_processor.log")
+    
+    try:
+        # Load configuration
+        config = load_config("config/config_vet_lva.yaml")
+        
+        # Create processor and run
+        processor = Neo4jSpecializationStreamProcessor(config)
+        processor.process()
+        
+        print("Specialization stream processing completed successfully!")
+        
+    except Exception as e:
+        logger.error(f"Specialization stream processing failed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

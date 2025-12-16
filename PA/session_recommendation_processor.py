@@ -19,16 +19,24 @@ Key Features:
 import os
 import json
 import time
+import re
 import logging
+import math
+import random
+from collections import defaultdict
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set, Any
 import concurrent.futures
 from sklearn.metrics.pairwise import cosine_similarity
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+from utils import vet_specific_functions
+from utils.neo4j_utils import resolve_neo4j_credentials
+
 
 
 # Try to import LangChain for advanced filtering (optional)
@@ -54,14 +62,50 @@ class SessionRecommendationProcessor:
         self.logger = self._setup_logging()
         
         # Extract configuration settings
+        self.mode = str(config.get("mode", "personal_agendas") or "personal_agendas").strip().lower()
         self.show_name = config.get("neo4j", {}).get("show_name", "bva")
         self.recommendation_config = config.get("recommendation", {})
         self.neo4j_config = config.get("neo4j", {})
+
+        control_cfg = self.recommendation_config.get("control_group", {}) or {}
+        self.control_group_config = control_cfg
+        self.control_group_enabled = bool(control_cfg.get("enabled", False))
+        self.control_group_percentage = self._normalize_percentage_value(
+            control_cfg.get("percentage", 0.0)
+        )
+        seed_value = control_cfg.get("random_seed")
+        self.control_group_random_seed: Optional[int]
+        if seed_value is None:
+            self.control_group_random_seed = None
+        else:
+            try:
+                self.control_group_random_seed = int(seed_value)
+            except (TypeError, ValueError):
+                self.logger.warning(
+                    "Invalid control_group.random_seed value '%s'; randomness will not be seeded",
+                    seed_value,
+                )
+                self.control_group_random_seed = None
+        self.control_group_file_suffix = str(control_cfg.get("file_suffix", "_control"))
+        self.control_group_output_directory = control_cfg.get("output_directory")
+        self.control_group_property_name = str(control_cfg.get("neo4j_property", "control_group"))
+
+        # Cache for Neo4j schema discovery
+        self._available_labels: Optional[Set[str]] = None
         
-        # Neo4j connection parameters
-        self.uri = self.neo4j_config.get("uri")
-        self.username = self.neo4j_config.get("username")
-        self.password = self.neo4j_config.get("password")
+        # Load Neo4j connection parameters from .env for consistency with other processors
+        env_file = config.get("env_file", "keys/.env")
+        load_dotenv(env_file)
+        credentials = resolve_neo4j_credentials(config, logger=self.logger)
+        self.uri = credentials["uri"]
+        self.username = credentials["username"]
+        self.password = credentials["password"]
+        self.neo4j_environment = credentials["environment"]
+        self.logger.info(
+            "Using Neo4j environment '%s' for show %s",
+            self.neo4j_environment,
+            self.show_name,
+        )
         
         # Recommendation parameters
         self.min_similarity_score = self.recommendation_config.get("min_similarity_score", 0.3)
@@ -69,6 +113,22 @@ class SessionRecommendationProcessor:
         self.similar_visitors_count = self.recommendation_config.get("similar_visitors_count", 3)
         self.use_langchain = self.recommendation_config.get("use_langchain", False) and has_langchain
         self.enable_filtering = self.recommendation_config.get("enable_filtering", False)
+        self.resolve_overlaps_by_similarity = self.recommendation_config.get(
+            "resolve_overlapping_sessions_by_similarity", False
+        )
+        returning_without_history_cfg = self.recommendation_config.get(
+            "returning_without_history", {}
+        )
+        self.handle_returning_without_history = returning_without_history_cfg.get(
+            "enabled", False
+        )
+        exponent_value = returning_without_history_cfg.get("similarity_exponent", 1.5)
+        try:
+            self.returning_without_history_exponent = float(exponent_value)
+        except (TypeError, ValueError):
+            self.returning_without_history_exponent = 1.5
+        if self.returning_without_history_exponent <= 0:
+            self.returning_without_history_exponent = 1.5
         
         # Similarity attributes for finding similar visitors
         self.similarity_attributes = self.recommendation_config.get("similarity_attributes", {})
@@ -87,6 +147,18 @@ class SessionRecommendationProcessor:
         
         # Filtering rules configuration (show-specific)
         self.rules_config = self.recommendation_config.get("rules_config", {})
+        event_cfg = self.config.get("event", {})
+        self.main_event_name = (
+            event_cfg.get("main_event_name")
+            or event_cfg.get("name")
+            or ""
+        ).lower()
+        self.custom_rules_config = self.rules_config.get("custom_rules", {})
+        self.custom_rules_enabled = (
+            self.enable_filtering
+            and bool(self.custom_rules_config.get("enabled", False))
+            and self._event_is_allowed_for_custom_rules()
+        )
         
         # Node labels from config
         self.visitor_this_year_label = self.neo4j_config.get("node_labels", {}).get(
@@ -129,7 +201,33 @@ class SessionRecommendationProcessor:
         # Output directory
         self.output_dir = Path(config.get("output_dir", "data/output"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # Intermediary CSV enrichment for step 10: override base profile and contact fields from registration+demographics output
+        # Base profile fields + contact fields commonly requested in exports
+        self._csv_enrichment_fields = [
+            "Company",
+            "JobTitle",
+            "Email_domain",
+            "Country",
+            "Source",
+            # Contact fields expected by ecomm/email.ipynb and export_additional_visitor_fields
+            "Email",
+            "Forename",
+            "Surname",
+            "Tel",
+            "Mobile",
+        ]
+        self._visitor_profile_map = {}
+        self._load_registration_demographics_this_year()
+
+        # Theatre capacity enforcement (configured per show)
+        self.theatre_limits_enabled = False
+        self.theatre_capacity_multiplier = 1.0
+        self.theatre_capacity_map: Dict[str, Optional[int]] = {}
+        self.session_slot_index: Dict[str, Dict[str, Any]] = {}
+        self._theatre_capacity_stats: Dict[str, Any] = {}
+        self._initialize_theatre_capacity_limits()
+
         self.logger.info(f"SessionRecommendationProcessor initialized for {self.show_name} show")
         self.logger.info(f"Filtering enabled: {self.enable_filtering}")
         if self.enable_filtering:
@@ -158,6 +256,550 @@ class SessionRecommendationProcessor:
             self.logger.error(f"Error initializing model: {str(e)}")
             self.model = None
 
+    def _fetch_available_labels(self) -> Set[str]:
+        """Fetch available Neo4j node labels for conditional query building."""
+        labels: Set[str] = set()
+        if not all([self.uri, self.username, self.password]):
+            return labels
+
+        try:
+            with GraphDatabase.driver(self.uri, auth=(self.username, self.password)) as driver:
+                with driver.session() as session:
+                    try:
+                        result = session.run("CALL db.labels()")
+                    except Exception:
+                        result = session.run("SHOW NODE LABELS")
+
+                    for record in result:
+                        label_value = record.get("label")
+                        if label_value:
+                            labels.add(label_value)
+
+            if labels:
+                self.logger.debug(
+                    "Discovered Neo4j node labels: %s",
+                    ", ".join(sorted(labels))
+                )
+        except Exception as e:
+            self.logger.warning(
+                "Unable to fetch Neo4j node labels for schema-aware queries: %s",
+                str(e)
+            )
+
+        return labels
+
+    def _label_exists(self, label: str) -> bool:
+        """Check if a label exists in the Neo4j database (cached)."""
+        if not label:
+            return False
+
+        if self._available_labels is None:
+            self._available_labels = self._fetch_available_labels()
+
+        return label in self._available_labels
+
+    def _get_available_past_labels(self) -> List[str]:
+        """Return the list of available labels for past-year visitors."""
+        labels: List[str] = []
+        for candidate in (self.visitor_last_year_bva_label, self.visitor_last_year_lva_label):
+            if self._label_exists(candidate):
+                labels.append(candidate)
+        return labels
+
+    def _event_is_allowed_for_custom_rules(self) -> bool:
+        """Check whether the current event is eligible for custom filtering rules."""
+
+        if not self.recommendation_config.get("enable_filtering", False):
+            return False
+
+        apply_to_events = self.custom_rules_config.get("apply_to_events")
+        if not apply_to_events:
+            return True
+
+        apply_to = {str(val).lower() for val in apply_to_events if val}
+        if not apply_to:
+            return True
+
+        event_cfg = self.config.get("event", {})
+        identifiers = [
+            self.main_event_name,
+            str(event_cfg.get("name", "")).lower(),
+            str(event_cfg.get("secondary_event_name", "")).lower(),
+            str(self.show_name).lower(),
+        ]
+
+        return any(identifier in apply_to for identifier in identifiers if identifier)
+
+    def _load_registration_demographics_this_year(self) -> None:
+        """Load intermediary CSV to enrich visitor attributes for output exports.
+        Reads the file configured under output_files.registration_with_demographic.this_year.
+        """
+        try:
+            out_cfg = self.config.get("output_files", {}).get("registration_with_demographic", {})
+            filename = out_cfg.get("this_year", "Registration_data_with_demographicdata_bva_this.csv")
+            # File is written under <output_dir>/output/<filename>
+            csv_path = Path(self.config.get("output_dir", "data/output")) / "output" / filename
+            if not csv_path.exists():
+                self.logger.info(f"Intermediary CSV for enrichment not found: {csv_path}")
+                return
+            df = pd.read_csv(csv_path, dtype=str)
+            if "BadgeId" not in df.columns:
+                self.logger.warning(f"Intermediary CSV missing 'BadgeId' column: {csv_path}")
+                return
+            # Keep only the fields we need
+            present_fields = [c for c in self._csv_enrichment_fields if c in df.columns]
+            if not present_fields:
+                self.logger.info("No enrichment fields present in intermediary CSV; skipping enrichment load")
+                return
+            subset = df[["BadgeId", *present_fields]].copy()
+            # Build map BadgeId -> field dict
+            for _, row in subset.iterrows():
+                bid = str(row.get("BadgeId", ""))
+                if not bid:
+                    continue
+                self._visitor_profile_map[bid] = {f: (row.get(f) if pd.notna(row.get(f)) else "NA") for f in present_fields}
+            self.logger.info(f"Loaded enrichment profiles for {len(self._visitor_profile_map)} visitors from {csv_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to load intermediary CSV enrichment: {str(e)}", exc_info=True)
+
+    @staticmethod
+    def _normalize_percentage_value(value: Any) -> float:
+        """Normalize percentage inputs supporting 0-1 fractions or 0-100 percentages."""
+
+        try:
+            percentage = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+        if percentage < 0:
+            return 0.0
+
+        if percentage > 1:
+            percentage = percentage / 100.0
+
+        return min(percentage, 1.0)
+
+    @staticmethod
+    def _normalize_theatre_name(name: Any) -> Optional[str]:
+        if not isinstance(name, str):
+            return None
+        normalized = re.sub(r"\s+", " ", name).strip()
+        return normalized.lower() if normalized else None
+
+    @staticmethod
+    def _parse_capacity_value(value: Any) -> Optional[int]:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text.replace(",", "")
+        try:
+            return int(float(text))
+        except (TypeError, ValueError):
+            return None
+
+    def _build_session_slot_key(
+        self,
+        normalized_theatre: Optional[str],
+        date_value: Any,
+        start_value: Any,
+        session_id: str,
+    ) -> str:
+        theatre_part = normalized_theatre or f"unknown::{session_id}"
+
+        def _clean(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, float) and math.isnan(value):
+                return ""
+            return str(value).strip()
+
+        date_part = _clean(date_value)
+        start_part = _clean(start_value)
+
+        if not date_part and not start_part:
+            return f"{theatre_part}|{session_id}"
+        return f"{theatre_part}|{date_part}|{start_part}"
+
+    @staticmethod
+    def _format_slot_label(slot_info: Dict[str, Any]) -> str:
+        theatre_name = slot_info.get("theatre_name") or slot_info.get("normalized_theatre") or "Unknown theatre"
+        date_value = slot_info.get("date")
+        start_value = slot_info.get("start_time")
+
+        parts = [str(theatre_name)]
+        if date_value is not None and not (isinstance(date_value, float) and math.isnan(date_value)):
+            parts.append(str(date_value))
+        if start_value is not None and not (isinstance(start_value, float) and math.isnan(start_value)):
+            parts.append(str(start_value))
+
+        if len(parts) == 1:
+            return parts[0]
+        return " @ ".join(parts)
+
+    def _initialize_theatre_capacity_limits(self) -> None:
+        """Load theatre capacity information and session slots when configured."""
+        config_section = self.recommendation_config.get("theatre_capacity_limits", {})
+        self.theatre_limits_enabled = bool(config_section.get("enabled", False))
+        self._theatre_capacity_stats = {
+            "recommendations_removed": 0,
+            "slots_limited": 0,
+            "sessions_missing_metadata": 0,
+            "sessions_without_capacity": 0,
+            "slots_processed": 0,
+        }
+
+        if not self.theatre_limits_enabled:
+            return
+
+        multiplier = config_section.get("capacity_multiplier", 1.0)
+        try:
+            self.theatre_capacity_multiplier = float(multiplier)
+            if self.theatre_capacity_multiplier < 0:
+                raise ValueError("capacity_multiplier must be non-negative")
+        except (TypeError, ValueError):
+            self.logger.warning(
+                "Invalid theatre capacity multiplier '%s'; defaulting to 1.0",
+                multiplier,
+            )
+            self.theatre_capacity_multiplier = 1.0
+
+        capacity_file = config_section.get("capacity_file")
+        session_file = config_section.get("session_file") or self.config.get("session_files", {}).get("session_this")
+
+        if not capacity_file or not session_file:
+            self.logger.warning(
+                "Theatre capacity limits enabled but capacity_file or session_file not configured; disabling enforcement",
+            )
+            self.theatre_limits_enabled = False
+            return
+
+        capacity_path = Path(capacity_file)
+        if not capacity_path.exists():
+            self.logger.warning(
+                "Theatre capacity file %s not found; disabling capacity enforcement",
+                capacity_path,
+            )
+            self.theatre_limits_enabled = False
+            return
+
+        session_path = Path(session_file)
+        if not session_path.exists():
+            self.logger.warning(
+                "Session file %s not found; disabling theatre capacity enforcement",
+                session_path,
+            )
+            self.theatre_limits_enabled = False
+            return
+
+        try:
+            capacity_df = pd.read_csv(capacity_path)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.error(
+                "Failed to load theatre capacity file %s: %s",
+                capacity_path,
+                exc,
+                exc_info=True,
+            )
+            self.theatre_limits_enabled = False
+            return
+
+        theatre_col = None
+        capacity_col = None
+        lower_columns = {col.lower(): col for col in capacity_df.columns}
+        for candidate in ("theatre__name", "theatre_name", "theatre"):
+            if candidate in capacity_df.columns:
+                theatre_col = candidate
+                break
+            if candidate in lower_columns:
+                theatre_col = lower_columns[candidate]
+                break
+
+        for candidate in ("number_visitors", "capacity", "max_visitors"):
+            if candidate in capacity_df.columns:
+                capacity_col = candidate
+                break
+            if candidate in lower_columns:
+                capacity_col = lower_columns[candidate]
+                break
+
+        if not theatre_col or not capacity_col:
+            self.logger.warning(
+                "Theatre capacity file %s missing required columns; disabling enforcement",
+                capacity_path,
+            )
+            self.theatre_limits_enabled = False
+            return
+
+        capacities: Dict[str, int] = {}
+        for _, row in capacity_df[[theatre_col, capacity_col]].iterrows():
+            theatre_name = row.get(theatre_col)
+            normalized = self._normalize_theatre_name(theatre_name)
+            if not normalized:
+                continue
+            capacity_value = self._parse_capacity_value(row.get(capacity_col))
+            if capacity_value is None:
+                continue
+            capacities[normalized] = capacity_value
+
+        if not capacities:
+            self.logger.warning(
+                "No valid theatre capacity values found in %s; disabling enforcement",
+                capacity_path,
+            )
+            self.theatre_limits_enabled = False
+            return
+
+        self.theatre_capacity_map = capacities
+
+        try:
+            session_df = pd.read_csv(session_path, dtype={"session_id": str})
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.error(
+                "Failed to load session file %s: %s",
+                session_path,
+                exc,
+                exc_info=True,
+            )
+            self.theatre_limits_enabled = False
+            return
+
+        if "session_id" not in session_df.columns:
+            self.logger.warning(
+                "Session file %s missing 'session_id' column; disabling theatre capacity enforcement",
+                session_path,
+            )
+            self.theatre_limits_enabled = False
+            return
+
+        session_df["session_id"] = session_df["session_id"].astype(str).str.strip()
+        session_df = session_df.drop_duplicates(subset=["session_id"], keep="first")
+
+        theatre_session_col = None
+        lower_session_cols = {col.lower(): col for col in session_df.columns}
+        for candidate in ("theatre__name", "theatre_name", "theatre"):
+            if candidate in session_df.columns:
+                theatre_session_col = candidate
+                break
+            if candidate in lower_session_cols:
+                theatre_session_col = lower_session_cols[candidate]
+                break
+
+        if not theatre_session_col:
+            self.logger.warning(
+                "Session file %s missing theatre column; disabling capacity enforcement",
+                session_path,
+            )
+            self.theatre_limits_enabled = False
+            return
+
+        date_col = None
+        for candidate in ("date", "session_date", "sessiondate"):
+            if candidate in session_df.columns:
+                date_col = candidate
+                break
+            if candidate in lower_session_cols:
+                date_col = lower_session_cols[candidate]
+                break
+
+        start_col = None
+        for candidate in ("start_time", "session_start_time", "starttime"):
+            if candidate in session_df.columns:
+                start_col = candidate
+                break
+            if candidate in lower_session_cols:
+                start_col = lower_session_cols[candidate]
+                break
+
+        self.session_slot_index = {}
+        for _, row in session_df.iterrows():
+            session_id = str(row.get("session_id", "")).strip()
+            if not session_id:
+                continue
+            if session_id in self.session_slot_index:
+                continue
+
+            theatre_name = row.get(theatre_session_col)
+            normalized_theatre = self._normalize_theatre_name(theatre_name)
+            date_value = row.get(date_col) if date_col else None
+            start_value = row.get(start_col) if start_col else None
+            slot_key = self._build_session_slot_key(normalized_theatre, date_value, start_value, session_id)
+            capacity_value = self.theatre_capacity_map.get(normalized_theatre)
+
+            self.session_slot_index[session_id] = {
+                "session_id": session_id,
+                "theatre_name": theatre_name if isinstance(theatre_name, str) else None,
+                "normalized_theatre": normalized_theatre,
+                "date": date_value,
+                "start_time": start_value,
+                "slot_key": slot_key,
+                "capacity": capacity_value,
+            }
+
+        if not self.session_slot_index:
+            self.logger.warning(
+                "Unable to map any sessions to theatres from %s; disabling theatre capacity enforcement",
+                session_path,
+            )
+            self.theatre_limits_enabled = False
+            return
+
+        self.logger.info(
+            "Theatre capacity enforcement enabled for %d theatres (multiplier %.2f)",
+            len(self.theatre_capacity_map),
+            self.theatre_capacity_multiplier,
+        )
+
+    def _enforce_theatre_capacity_limits(self, recommendations: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, int]]:
+        """Trim recommendations so per-theatre slots respect configured capacity limits."""
+        if not self.theatre_limits_enabled:
+            return None
+
+        slot_recommendations: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        missing_metadata = 0
+        missing_capacity = 0
+
+        for visitor_id, payload in recommendations.items():
+            recs = payload.get("filtered_recommendations", []) or []
+            for rec in recs:
+                session_id = rec.get("session_id")
+                if not session_id:
+                    continue
+                session_meta = self.session_slot_index.get(str(session_id))
+                if not session_meta:
+                    missing_metadata += 1
+                    continue
+                capacity = session_meta.get("capacity")
+                if capacity is None:
+                    missing_capacity += 1
+                    continue
+                slot_key = session_meta.get("slot_key")
+                slot_recommendations[slot_key].append(
+                    {
+                        "visitor_id": visitor_id,
+                        "payload": payload,
+                        "record": rec,
+                        "similarity": rec.get("similarity", 0) or 0,
+                        "session_meta": session_meta,
+                    }
+                )
+
+        adjustments = {
+            "recommendations_removed": 0,
+            "slots_limited": 0,
+            "sessions_missing_metadata": missing_metadata,
+            "sessions_without_capacity": missing_capacity,
+            "slots_processed": len(slot_recommendations),
+        }
+
+        for slot_key, entries in slot_recommendations.items():
+            if not entries:
+                continue
+
+            session_meta = entries[0]["session_meta"]
+            capacity = session_meta.get("capacity")
+            if capacity is None or capacity <= 0:
+                continue
+
+            allowed = int(math.floor(capacity * self.theatre_capacity_multiplier))
+            if allowed < 0:
+                allowed = 0
+
+            if len(entries) <= allowed:
+                continue
+
+            adjustments["slots_limited"] += 1
+
+            entries.sort(key=lambda item: (item.get("similarity", 0),), reverse=True)
+            to_keep = entries[:allowed]
+            keep_set = {id(item) for item in to_keep}
+
+            for entry in entries:
+                if id(entry) in keep_set:
+                    continue
+
+                payload = entry["payload"]
+                rec = entry["record"]
+                filtered_recs = payload.get("filtered_recommendations", [])
+                if rec in filtered_recs:
+                    filtered_recs.remove(rec)
+                    adjustments["recommendations_removed"] += 1
+                    metadata = payload.setdefault("metadata", {})
+                    metadata["filtered_count"] = len(filtered_recs)
+                    notes = metadata.setdefault("notes", [])
+                    slot_label = self._format_slot_label(session_meta)
+                    notes.append(
+                        f"Removed session {rec.get('session_id')} due to theatre capacity limit ({slot_label}, limit {allowed})"
+                    )
+
+        self._theatre_capacity_stats = adjustments
+        return adjustments
+
+    def _apply_csv_enrichment(self, visitor: Dict) -> Dict:
+        """Override base fields with values from intermediary CSV when present."""
+        try:
+            bid = str(visitor.get("BadgeId", ""))
+            if not bid or bid not in self._visitor_profile_map:
+                return visitor
+            enrichment = self._visitor_profile_map[bid]
+            for field in self._csv_enrichment_fields:
+                if field in enrichment:
+                    visitor[field] = enrichment.get(field, visitor.get(field, "NA"))
+            return visitor
+        except Exception:
+            return visitor
+
+    def _prepare_similarity_criteria(self, visitor: Dict) -> List[Dict[str, object]]:
+        """Build similarity criteria from configuration for a specific visitor."""
+        criteria: List[Dict[str, object]] = []
+
+        if not isinstance(self.similarity_attributes, dict):
+            return criteria
+
+        for attribute, config_value in self.similarity_attributes.items():
+            # Support both shorthand numeric weight and extended dictionaries
+            if isinstance(config_value, dict):
+                weight = float(config_value.get("weight", 0))
+                visitor_field = config_value.get("visitor_field", attribute)
+                property_names = config_value.get("properties") or config_value.get("neo4j_properties")
+            else:
+                weight = float(config_value)
+                visitor_field = attribute
+                property_names = None
+
+            if weight <= 0:
+                continue
+
+            value = visitor.get(visitor_field)
+            if isinstance(value, str):
+                value = value.strip()
+                if not value or value.upper() == "NA":
+                    continue
+            elif value is None or pd.isna(value):
+                continue
+
+            if property_names is None:
+                property_names = [attribute]
+            elif isinstance(property_names, str):
+                property_names = [property_names]
+
+            property_names = [name for name in property_names if name]
+            if not property_names:
+                continue
+
+            criteria.append(
+                {
+                    "attribute": attribute,
+                    "visitor_field": visitor_field,
+                    "value": value,
+                    "weight": weight,
+                    "property_names": property_names,
+                }
+            )
+
+        return criteria
+
     def _get_visitors_to_process(self, create_only_new: bool = False) -> List[str]:
         """
         Get list of visitors to process based on create_only_new flag.
@@ -175,11 +817,13 @@ class SessionRecommendationProcessor:
                 with driver.session() as session:
                     if create_only_new:
                         # Only get visitors without recommendations
-                        # Check for NULL, "0", or missing has_recommendation
+                        # Newer Neo4j versions deprecate NOT EXISTS(variable.property) for property existence.
+                        # If a property does not exist, referencing it returns NULL, so the IS NULL predicate
+                        # covers both missing and explicit null cases. We also include = "0" for unprocessed.
                         query = f"""
                         MATCH (v:{self.visitor_this_year_label})
                         WHERE (v.show = $show_name OR v.show IS NULL)
-                        AND (v.has_recommendation IS NULL OR v.has_recommendation = "0" OR NOT EXISTS(v.has_recommendation))
+                        AND (v.has_recommendation IS NULL OR v.has_recommendation = "0")
                         RETURN v.BadgeId as badge_id
                         """
                     else:
@@ -224,6 +868,8 @@ class SessionRecommendationProcessor:
                     
                     if record:
                         visitor_data = dict(record["v"])
+                        # Apply CSV enrichment overrides for base context fields
+                        visitor_data = self._apply_csv_enrichment(visitor_data)
                         self._visitor_cache[badge_id] = visitor_data
                         return visitor_data
                     
@@ -259,102 +905,112 @@ class SessionRecommendationProcessor:
             return []
 
     def _find_similar_visitors(self, visitor: Dict, limit: int = 3) -> List[str]:
-        """
-        Find similar visitors based on configured similarity attributes.
-        Modified to introduce randomness and reduce bias towards the same visitors.
-        
-        Args:
-            visitor: The visitor dictionary
-            limit: Maximum number of similar visitors to return
-            
-        Returns:
-            List of similar visitor badge IDs
-        """
+        """Find similar visitors based on configuration-driven similarity criteria."""
         import random
-        
+
         visitor_id = visitor.get("BadgeId")
-        
-        # Check cache first - but now include a randomization factor in cache key
-        # to allow for different random selections over time
-        cache_key = f"{visitor_id}_{limit}"
+        if not visitor_id:
+            return []
+
+        criteria = self._prepare_similarity_criteria(visitor)
+        if not criteria:
+            self.logger.warning(f"No valid similarity attributes for visitor {visitor_id}")
+            return []
+
+        cache_key = (visitor_id, tuple((c["attribute"], str(c["value"])) for c in criteria), limit)
         if cache_key in self._similar_visitors_cache:
             return self._similar_visitors_cache[cache_key]
-        
+
         try:
-            with GraphDatabase.driver(
-                self.uri, auth=(self.username, self.password)
-            ) as driver:
+            with GraphDatabase.driver(self.uri, auth=(self.username, self.password)) as driver:
                 with driver.session() as session:
-                    # Build WHERE clauses based on similarity attributes
-                    where_clauses = []
-                    params = {"visitor_id": visitor_id, "show_name": self.show_name}
-                    
-                    for attr, weight in self.similarity_attributes.items():
-                        if weight > 0 and attr in visitor and visitor[attr] not in [None, "NA", ""]:
-                            # Map the attribute name if needed
-                            neo4j_attr = attr
-                            
-                            where_clauses.append(f"v2.{neo4j_attr} = $attr_{attr}")
-                            params[f"attr_{attr}"] = visitor[attr]
-                    
-                    if not where_clauses:
-                        self.logger.warning(f"No valid similarity attributes for visitor {visitor_id}")
+                    params: Dict[str, object] = {
+                        "visitor_id": visitor_id,
+                        "show_name": self.show_name,
+                    }
+
+                    case_clauses: List[str] = []
+                    for idx, criterion in enumerate(criteria):
+                        param_name = re.sub(r"[^A-Za-z0-9_]", "_", f"sim_attr_{idx}_{criterion['attribute']}")
+                        params[param_name] = criterion["value"]
+
+                        property_checks = [f"v2.{prop} = ${param_name}" for prop in criterion["property_names"]]
+                        combined_condition = " OR ".join(property_checks)
+                        case_clauses.append(
+                            f"CASE WHEN {combined_condition} THEN {criterion['weight']} ELSE 0 END"
+                        )
+
+                    if not case_clauses:
+                        self.logger.warning(f"No similarity clauses generated for visitor {visitor_id}")
                         return []
-                    
-                    # Modified query: Remove LIMIT and get ALL similar visitors first
-                    # Then apply randomization in Python to select the final subset
+
+                    base_similarity_expr = " + ".join(case_clauses)
+
+                    available_past_labels = self._get_available_past_labels()
+                    if not available_past_labels:
+                        self.logger.warning(
+                            "No past-year visitor labels available in Neo4j; skipping similar visitor lookup."
+                        )
+                        return []
+
+                    if len(available_past_labels) == 1:
+                        match_v2_clause = f"MATCH (v2:{available_past_labels[0]})"
+                        label_condition = ""
+                    else:
+                        match_v2_clause = "MATCH (v2)"
+                        label_condition = " AND (" + " OR ".join(
+                            f"v2:{label}" for label in available_past_labels
+                        ) + ")"
+
                     query = f"""
                     MATCH (v1:{self.visitor_this_year_label} {{BadgeId: $visitor_id}})
                     WHERE v1.show = $show_name OR v1.show IS NULL
-                    MATCH (v2:{self.visitor_last_year_bva_label})
-                    WHERE v2.BadgeId <> $visitor_id AND ({" OR ".join(where_clauses)})
+                    {match_v2_clause}
+                    WHERE v2.BadgeId <> $visitor_id AND (v2.show = $show_name OR v2.show IS NULL){label_condition}
+                    WITH v2, {base_similarity_expr} AS base_similarity
+                    WHERE base_similarity > 0
                     MATCH (v2)-[:attended_session]->(s:{self.session_past_year_label})
-                    WITH v2.BadgeId as similar_visitor, COUNT(DISTINCT s) as sessions_attended
+                    WITH v2.BadgeId AS similar_visitor, base_similarity, COUNT(DISTINCT s) AS sessions_attended
                     WHERE sessions_attended > 0
-                    ORDER BY sessions_attended DESC
-                    RETURN similar_visitor, sessions_attended
+                    RETURN similar_visitor, sessions_attended, base_similarity
+                    ORDER BY base_similarity DESC, sessions_attended DESC
                     """
-                    
+
                     result = session.run(query, **params)
-                    all_similar_visitors = [(record["similar_visitor"], record["sessions_attended"]) 
-                                        for record in result]
-                    
-                    if not all_similar_visitors:
+                    all_candidates = [
+                        (
+                            record["similar_visitor"],
+                            record["sessions_attended"],
+                            record["base_similarity"],
+                        )
+                        for record in result
+                    ]
+
+                    if not all_candidates:
                         self.logger.warning(f"No similar visitors found for visitor {visitor_id}")
                         return []
-                    
-                    # Determine how many visitors to consider for random selection
-                    # We want to get the top performers but introduce randomness
-                    total_found = len(all_similar_visitors)
-                    
+
+                    total_found = len(all_candidates)
+
                     if total_found <= limit:
-                        # If we have fewer or equal visitors than needed, return all
-                        similar_visitors = [visitor_id for visitor_id, _ in all_similar_visitors]
+                        similar_visitors = [badge for badge, _, _ in all_candidates]
                     else:
-                        # Strategy: Take a larger subset of high-performing visitors and randomly select from them
-                        # This balances between getting good visitors and introducing randomness
-                        
-                        # Take top performers (but more than we need) for random selection
-                        # Use a multiplier to get a reasonable pool for randomization
-                        pool_size = min(total_found, max(limit * 3, 10))  # At least 3x the limit or 10, whichever is smaller
-                        
-                        # Get the top pool_size visitors by session count
-                        top_visitors_pool = all_similar_visitors[:pool_size]
-                        
-                        # Now randomly select 'limit' visitors from this pool
-                        selected_visitors = random.sample(top_visitors_pool, min(limit, len(top_visitors_pool)))
-                        similar_visitors = [visitor_id for visitor_id, _ in selected_visitors]
-                    
-                    # Cache the result
+                        pool_size = min(total_found, max(limit * 3, 10))
+                        top_pool = all_candidates[:pool_size]
+                        selected = random.sample(top_pool, min(limit, len(top_pool)))
+                        similar_visitors = [badge for badge, _, _ in selected]
+
                     self._similar_visitors_cache[cache_key] = similar_visitors
-                    
+
                     self.logger.info(
-                        f"Found {total_found} total similar visitors for {visitor_id}, "
-                        f"randomly selected {len(similar_visitors)} from top performers"
+                        "Found %d total similar visitors for %s, randomly selected %d from top performers",
+                        total_found,
+                        visitor_id,
+                        len(similar_visitors),
                     )
-                    
+
                     return similar_visitors
-                    
+
         except Exception as e:
             self.logger.error(f"Error finding similar visitors: {str(e)}")
             return []
@@ -378,23 +1034,52 @@ class SessionRecommendationProcessor:
                 self.uri, auth=(self.username, self.password)
             ) as driver:
                 with driver.session() as session:
+                    available_past_labels = self._get_available_past_labels()
+                    if not available_past_labels:
+                        self.logger.warning(
+                            "No past-year visitor labels available in Neo4j; skipping past session lookup."
+                        )
+                        return []
+
                     if is_returning:
                         # For returning visitors, follow the Same_Visitor relationship
                         # because they have DIFFERENT BadgeIds between years!
-                        query = f"""
-                        MATCH (v:{self.visitor_this_year_label})-[:Same_Visitor]->(v_past)
-                        WHERE v.BadgeId IN $visitor_ids
-                        AND (v_past:{self.visitor_last_year_bva_label} OR v_past:{self.visitor_last_year_lva_label})
-                        MATCH (v_past)-[:attended_session]->(s:{self.session_past_year_label})
-                        RETURN DISTINCT s
-                        """
+                        if len(available_past_labels) == 1:
+                            label = available_past_labels[0]
+                            query = f"""
+                            MATCH (v:{self.visitor_this_year_label})-[:Same_Visitor]->(v_past:{label})
+                            WHERE v.BadgeId IN $visitor_ids
+                            MATCH (v_past)-[:attended_session]->(s:{self.session_past_year_label})
+                            RETURN DISTINCT s
+                            """
+                        else:
+                            label_condition = " OR ".join(
+                                f"v_past:{label}" for label in available_past_labels
+                            )
+                            query = f"""
+                            MATCH (v:{self.visitor_this_year_label})-[:Same_Visitor]->(v_past)
+                            WHERE v.BadgeId IN $visitor_ids AND ({label_condition})
+                            MATCH (v_past)-[:attended_session]->(s:{self.session_past_year_label})
+                            RETURN DISTINCT s
+                            """
                     else:
                         # For similar visitors (new visitors), query directly with their past year BadgeIds
-                        query = f"""
-                        MATCH (v:{self.visitor_last_year_bva_label})-[:attended_session]->(s:{self.session_past_year_label})
-                        WHERE v.BadgeId IN $visitor_ids
-                        RETURN DISTINCT s
-                        """
+                        if len(available_past_labels) == 1:
+                            label = available_past_labels[0]
+                            query = f"""
+                            MATCH (v:{label})-[:attended_session]->(s:{self.session_past_year_label})
+                            WHERE v.BadgeId IN $visitor_ids
+                            RETURN DISTINCT s
+                            """
+                        else:
+                            label_condition = " OR ".join(
+                                f"v:{label}" for label in available_past_labels
+                            )
+                            query = f"""
+                            MATCH (v)-[:attended_session]->(s:{self.session_past_year_label})
+                            WHERE v.BadgeId IN $visitor_ids AND ({label_condition})
+                            RETURN DISTINCT s
+                            """
                     
                     result = session.run(query, visitor_ids=visitor_ids)
                     sessions = [dict(record["s"]) for record in result]
@@ -506,46 +1191,48 @@ class SessionRecommendationProcessor:
         rules_applied = []
         
         # Check for different practice types based on configuration
-        # For veterinary shows
-        if self.show_name == "bva" and self.rules_config:
-            # Check if practice contains equine or mixed
-            if self._contains_any(practice_type, ["equine", "mixed"]):
-                exclusions = self.rules_config.get("equine_mixed_exclusions", [])
-                if exclusions:
-                    filtered_sessions = [
-                        session for session in sessions
-                        if not session.get("stream") or not self._contains_any(session["stream"], exclusions)
-                    ]
-                    rules_applied.append(f"practice_type: mixed/equine - excluded {', '.join(exclusions)}")
-                    self.logger.info(
-                        f"Applied equine/mixed rule: filtered from {len(sessions)} to {len(filtered_sessions)} sessions"
-                    )
-            
-            # Check if practice contains small animal
-            elif self._contains_any(practice_type, ["small animal"]):
-                exclusions = self.rules_config.get("small_animal_exclusions", [])
-                if exclusions:
-                    filtered_sessions = [
-                        session for session in sessions
-                        if not session.get("stream") or not self._contains_any(session["stream"], exclusions)
-                    ]
-                    rules_applied.append(f"practice_type: small animal - excluded {', '.join(exclusions)}")
-                    self.logger.info(
-                        f"Applied small animal rule: filtered from {len(sessions)} to {len(filtered_sessions)} sessions"
-                    )
-            else:
-                filtered_sessions = sessions
-        
-        # For other shows, check if there are custom rules in config
-        else:
-            # Apply any custom filtering rules from configuration
-            custom_rules = self.rules_config.get("custom_practice_rules", [])
-            if custom_rules:
-                # Implement custom rule logic here if needed
-                filtered_sessions = sessions
-            else:
-                filtered_sessions = sessions
-        
+        filtered_sessions = sessions
+
+        # Check if practice contains equine or mixed
+        if self._contains_any(practice_type, ["equine", "mixed"]):
+            exclusions = self.rules_config.get("equine_mixed_exclusions", [])
+            if exclusions:
+                filtered_sessions = [
+                    session for session in filtered_sessions
+                    if not session.get("stream") or not self._contains_any(str(session["stream"]), exclusions)
+                ]
+                rules_applied.append(
+                    f"practice_type: mixed/equine - excluded {', '.join(exclusions)}"
+                )
+                self.logger.info(
+                    "Applied equine/mixed rule: filtered from %d to %d sessions",
+                    len(sessions),
+                    len(filtered_sessions),
+                )
+
+        # Check if practice contains small animal
+        elif self._contains_any(practice_type, ["small animal"]):
+            exclusions = self.rules_config.get("small_animal_exclusions", [])
+            if exclusions:
+                filtered_sessions = [
+                    session for session in filtered_sessions
+                    if not session.get("stream") or not self._contains_any(str(session["stream"]), exclusions)
+                ]
+                rules_applied.append(
+                    f"practice_type: small animal - excluded {', '.join(exclusions)}"
+                )
+                self.logger.info(
+                    "Applied small animal rule: filtered from %d to %d sessions",
+                    len(sessions),
+                    len(filtered_sessions),
+                )
+
+        # Apply any custom filtering rules from configuration
+        custom_rules = self.rules_config.get("custom_practice_rules", [])
+        if custom_rules:
+            # Placeholder for custom rules if defined
+            pass
+
         return filtered_sessions if filtered_sessions else sessions, rules_applied
 
     def _apply_role_rules(self, visitor: Dict, sessions: List[Dict]) -> Tuple[List[Dict], List[str]]:
@@ -668,34 +1355,67 @@ class SessionRecommendationProcessor:
                 self.uri, auth=(self.username, self.password)
             ) as driver:
                 with driver.session() as session:
+                    if not self._label_exists(self.session_past_year_label):
+                        self.logger.warning(
+                            "Past-year session label '%s' is not present in Neo4j; popular session fallback will be skipped.",
+                            self.session_past_year_label,
+                        )
+                        return []
+
+                    available_past_labels = self._get_available_past_labels()
+                    if not available_past_labels:
+                        self.logger.warning(
+                            "No past-year visitor labels available in Neo4j; popular session fallback cannot be computed."
+                        )
+                        return []
+
+                    main_label_exists = self.visitor_last_year_bva_label in available_past_labels
+                    secondary_label_exists = self.visitor_last_year_lva_label in available_past_labels
+
                     # Determine how many sessions to fetch from the database
                     # We want at least 'limit' sessions, but if max_recommendations is higher,
                     # fetch more to have a good pool for random selection
                     fetch_limit = max(limit, self.max_recommendations)
                     
-                    # Query that includes both BVA and LVA visitors for the specific show
-                    query = f"""
-                    // Get sessions for this specific show
-                    MATCH (s:{self.session_past_year_label})
-                    WHERE s.show = $show_name
-                    
-                    // Count attendance from main event (BVA) visitors
-                    OPTIONAL MATCH (v_main:{self.visitor_last_year_bva_label})-[:attended_session]->(s)
-                    WITH s, COUNT(DISTINCT v_main) as main_event_count
-                    
-                    // Also count attendance from secondary event (LVA) visitors  
-                    OPTIONAL MATCH (v_secondary:{self.visitor_last_year_lva_label})-[:attended_session]->(s)
-                    WITH s, main_event_count, COUNT(DISTINCT v_secondary) as secondary_event_count
-                    
-                    // Combine counts from both events (same audience, different locations/dates)
-                    WITH s, (main_event_count + secondary_event_count) as total_attendance
-                    WHERE total_attendance > 0
-                    
-                    // Order by popularity and return top sessions
-                    ORDER BY total_attendance DESC
-                    LIMIT $limit
-                    RETURN s, total_attendance
-                    """
+                    # Build attendance aggregation dynamically based on available labels
+                    query_parts: List[str] = [
+                        f"MATCH (s:{self.session_past_year_label})",
+                        "WHERE s.show = $show_name",
+                    ]
+
+                    if main_label_exists:
+                        query_parts.extend(
+                            [
+                                f"OPTIONAL MATCH (v_main:{self.visitor_last_year_bva_label})-[:attended_session]->(s)",
+                                "WITH s, COUNT(DISTINCT v_main) as main_event_count",
+                            ]
+                        )
+                    else:
+                        query_parts.append("WITH s, 0 as main_event_count")
+
+                    if secondary_label_exists:
+                        query_parts.extend(
+                            [
+                                f"OPTIONAL MATCH (v_secondary:{self.visitor_last_year_lva_label})-[:attended_session]->(s)",
+                                "WITH s, main_event_count, COUNT(DISTINCT v_secondary) as secondary_event_count",
+                            ]
+                        )
+                    else:
+                        query_parts.append(
+                            "WITH s, main_event_count, 0 as secondary_event_count"
+                        )
+
+                    query_parts.extend(
+                        [
+                            "WITH s, (main_event_count + secondary_event_count) as total_attendance",
+                            "WHERE total_attendance > 0",
+                            "ORDER BY total_attendance DESC",
+                            "LIMIT $limit",
+                            "RETURN s, total_attendance",
+                        ]
+                    )
+
+                    query = "\n".join(query_parts)
                     
                     result = session.run(
                         query,
@@ -753,93 +1473,328 @@ class SessionRecommendationProcessor:
             self.logger.error(f"Error getting popular sessions for show '{self.show_name}': {str(e)}")
             return []
 
-    def generate_recommendations_for_visitor(self, badge_id: str) -> Tuple[List[Dict], Dict]:
-        """
-        Generate recommendations for a single visitor.
-        
-        Args:
-            badge_id: Visitor's badge ID
-            
-        Returns:
-            Tuple of (recommendations, visitor_info)
-        """
+    def generate_recommendations_for_visitor(self, badge_id: str) -> Dict[str, Any]:
+        """Generate a rich recommendation payload for a single visitor."""
+
+        result: Dict[str, Any] = {
+            "visitor": {},
+            "raw_recommendations": [],
+            "filtered_recommendations": [],
+            "rules_applied": [],
+            "metadata": {
+                "raw_count": 0,
+                "filtered_count": 0,
+                "filtering_strategy": "disabled",
+                "generation_strategy": "",
+                "notes": [],
+            },
+        }
+
         try:
-            # Get visitor information
             visitor = self._get_visitor_info(badge_id)
             if not visitor:
                 self.logger.warning(f"Visitor {badge_id} not found")
-                return [], {}
-            
-            # Get this year's sessions
+                result["metadata"]["notes"] = ["Visitor not found in graph"]
+                return result
+
+            result["visitor"] = visitor
+
             this_year_sessions = self._get_this_year_sessions()
             if not this_year_sessions:
                 self.logger.warning("No sessions available for this year")
-                return [], visitor
-            
-            # Check if visitor attended last year
+                result["metadata"]["notes"] = ["No sessions available for this year"]
+                return result
+
             assist_year_before = visitor.get("assist_year_before", "0")
-            past_sessions = []
-            
+            past_sessions: List[Dict] = []
+            generation_notes: List[str] = []
+            generation_strategy = ""
+            should_adjust_similarity = False
+            similarity_adjustment_reason = ""
+
             if assist_year_before == "1":
-                # Returning visitor - get their past sessions via Same_Visitor relationship
+                generation_notes.append("Returning visitor")
                 past_sessions = self._get_past_sessions_for_visitors([badge_id], is_returning=True)
-                
+                has_past_attendance = bool(past_sessions)
+                if self.handle_returning_without_history and not has_past_attendance:
+                    should_adjust_similarity = True
+                    similarity_adjustment_reason = "returning_without_history"
+
                 if past_sessions:
-                    self.logger.info(f"Returning visitor {badge_id} attended {len(past_sessions)} sessions last year")
+                    generation_strategy = "returning_past_sessions"
+                    generation_notes.append(
+                        f"Source: own past sessions ({len(past_sessions)} sessions)"
+                    )
+                    self.logger.info(
+                        f"Returning visitor {badge_id} attended {len(past_sessions)} sessions last year"
+                    )
                 else:
-                    # Returning visitor with no past sessions - treat as new visitor
                     self.logger.warning(
                         f"Returning visitor {badge_id} has no past session records - treating as new visitor"
                     )
-                    similar_visitors = self._find_similar_visitors(visitor, self.similar_visitors_count)
+                    similar_visitors = self._find_similar_visitors(
+                        visitor, self.similar_visitors_count
+                    )
                     if similar_visitors:
-                        past_sessions = self._get_past_sessions_for_visitors(similar_visitors, is_returning=False)
+                        past_sessions = self._get_past_sessions_for_visitors(
+                            similar_visitors, is_returning=False
+                        )
+                        generation_strategy = "returning_similar_visitors"
+                        generation_notes.append(
+                            f"Source: similar visitors ({len(similar_visitors)} visitors, {len(past_sessions)} sessions)"
+                        )
                         self.logger.info(
                             f"Found {len(past_sessions)} sessions from {len(similar_visitors)} similar visitors"
                         )
                     else:
-                        # No similar visitors found - use popular sessions as fallback
-                        self.logger.warning(f"No similar visitors found for returning visitor {badge_id} - using popular sessions")
-                        past_sessions = self._get_popular_past_sessions(limit=self.max_recommendations*5)
+                        generation_strategy = "returning_popular_fallback"
+                        generation_notes.append("Fallback applied: popular sessions")
+                        self.logger.warning(
+                            f"No similar visitors found for returning visitor {badge_id} - using popular sessions"
+                        )
+                        past_sessions = self._get_popular_past_sessions(
+                            limit=self.max_recommendations * 5
+                        )
                         if not past_sessions:
-                            self.logger.error(f"No sessions available for recommendations for {badge_id}")
-                            return [], visitor
+                            generation_notes.append("No sessions available for recommendations")
+                            result["metadata"]["notes"] = generation_notes
+                            return result
             else:
-                # New visitor - find similar visitors
-                similar_visitors = self._find_similar_visitors(visitor, self.similar_visitors_count)
+                generation_notes.append("New visitor")
+                similar_visitors = self._find_similar_visitors(
+                    visitor, self.similar_visitors_count
+                )
                 if similar_visitors:
-                    past_sessions = self._get_past_sessions_for_visitors(similar_visitors, is_returning=False)
-                    self.logger.info(f"New visitor {badge_id}: found {len(past_sessions)} sessions from similar visitors")
+                    past_sessions = self._get_past_sessions_for_visitors(
+                        similar_visitors, is_returning=False
+                    )
+                    generation_strategy = "new_similar_visitors"
+                    generation_notes.append(
+                        f"Source: similar visitors ({len(similar_visitors)} visitors, {len(past_sessions)} sessions)"
+                    )
+                    self.logger.info(
+                        f"New visitor {badge_id}: found {len(past_sessions)} sessions from similar visitors"
+                    )
                 else:
-                    # No similar visitors found - use popular sessions as fallback
-                    self.logger.warning(f"No similar visitors found for {badge_id} - using popular sessions as fallback")
-                    past_sessions = self._get_popular_past_sessions(limit=self.max_recommendations*5)
+                    generation_strategy = "new_popular_fallback"
+                    generation_notes.append("Fallback applied: popular sessions")
+                    self.logger.warning(
+                        f"No similar visitors found for {badge_id} - using popular sessions as fallback"
+                    )
+                    past_sessions = self._get_popular_past_sessions(
+                        limit=self.max_recommendations * 5
+                    )
                     if not past_sessions:
-                        self.logger.error(f"No sessions available for recommendations for {badge_id}")
-                        return [], visitor
-            
-            # Calculate recommendations
+                        generation_notes.append("No sessions available for recommendations")
+                        result["metadata"]["notes"] = generation_notes
+                        return result
+
+            raw_recommendations: List[Dict] = []
             if past_sessions:
-                recommendations = self.calculate_session_similarities(
+                raw_recommendations = self.calculate_session_similarities(
                     past_sessions, this_year_sessions, self.min_similarity_score
                 )
-                
-                # Apply filtering if enabled
-                if self.enable_filtering and recommendations:
-                    filtered_recommendations, rules_applied = self.filter_sessions(visitor, recommendations)
-                    self.logger.info(f"Filtered {len(recommendations)} to {len(filtered_recommendations)} recommendations")
-                    return filtered_recommendations[:self.max_recommendations], visitor
+
+            raw_count = len(raw_recommendations)
+            generation_notes.append(f"Retrieved {raw_count} raw recommendations")
+
+            filtered_recommendations = raw_recommendations
+            removed_overlap_sessions: List[Dict] = []
+            rules_applied: List[str] = []
+            filtering_message = "Filtering disabled"
+            filtering_strategy = "disabled"
+
+            if self.use_langchain:
+                filtering_strategy = "langchain"
+                filtering_message = "Using LangChain filtering"
+            elif self.enable_filtering:
+                filtering_strategy = "rule_based"
+                filtering_message = "Using rule-based filtering"
+
+            if self.enable_filtering and raw_recommendations:
+                filtered_recommendations, rules_applied = self.filter_sessions(
+                    visitor, raw_recommendations
+                )
+                self.logger.info(
+                    f"Filtered {len(raw_recommendations)} to {len(filtered_recommendations)} recommendations"
+                )
+
+            custom_rules_metadata = {
+                "enabled": self.custom_rules_enabled,
+                "applied": False,
+                "rule_results": [],
+                "notes": [],
+            }
+
+            if self.custom_rules_enabled and filtered_recommendations:
+                filtered_recommendations, custom_rules_summary = (
+                    self._apply_custom_recommendation_rules(
+                        visitor, filtered_recommendations
+                    )
+                )
+                custom_rules_metadata["applied"] = True
+                custom_rules_metadata["rule_results"] = custom_rules_summary.get(
+                    "rule_results", []
+                )
+                custom_rules_metadata["notes"] = custom_rules_summary.get("notes", [])
+                if "error" in custom_rules_summary:
+                    custom_rules_metadata["error"] = custom_rules_summary["error"]
+
+                if custom_rules_metadata["notes"]:
+                    generation_notes.extend(custom_rules_metadata["notes"])
+
+                removed_total = sum(
+                    int(result.get("removed_count", 0) or 0)
+                    for result in custom_rules_metadata["rule_results"]
+                )
+                if removed_total:
+                    generation_notes.append(
+                        f"Custom rules removed {removed_total} session(s)"
+                    )
+                elif not custom_rules_summary.get("error"):
+                    generation_notes.append("Custom rules applied with no removals")
+            else:
+                if self.custom_rules_config.get("enabled", False):
+                    generation_notes.append(
+                        "Custom rules inactive (event or filtering conditions not met)"
+                    )
+
+            filtered_recommendations = self._annotate_overlaps_for_recommendations(
+                filtered_recommendations, badge_id
+            )
+
+            if self.resolve_overlaps_by_similarity and filtered_recommendations:
+                (
+                    filtered_recommendations,
+                    removed_overlap_sessions,
+                ) = self._resolve_overlapping_recommendations_by_similarity(
+                    filtered_recommendations
+                )
+                filtered_recommendations = self._annotate_overlaps_for_recommendations(
+                    filtered_recommendations, badge_id
+                )
+
+            generation_notes.append(filtering_message)
+            if rules_applied:
+                generation_notes.extend(rules_applied)
+            elif self.enable_filtering:
+                generation_notes.append("No filtering rules applied")
+
+            if self.resolve_overlaps_by_similarity:
+                if removed_overlap_sessions:
+                    removed_ids = [
+                        str(rec.get("session_id"))
+                        for rec in removed_overlap_sessions
+                        if rec.get("session_id")
+                    ]
+                    removed_ids_str = ", ".join(removed_ids) if removed_ids else ""
+                    if removed_ids_str:
+                        generation_notes.append(
+                            f"Overlap resolution removed {len(removed_overlap_sessions)} session(s): {removed_ids_str}"
+                        )
+                    else:
+                        generation_notes.append(
+                            f"Overlap resolution removed {len(removed_overlap_sessions)} session(s)"
+                        )
+                    self.logger.info(
+                        "Removed %d overlapping session(s) for visitor %s via similarity resolution",
+                        len(removed_overlap_sessions),
+                        badge_id,
+                    )
                 else:
-                    return recommendations[:self.max_recommendations], visitor
-            
-            return [], visitor
-            
+                    generation_notes.append("Overlap resolution applied: no conflicts detected")
+            else:
+                generation_notes.append("Overlap resolution disabled")
+
+            # Apply max recommendations cap
+            filtered_recommendations = filtered_recommendations[: self.max_recommendations]
+
+            similarity_exponent_applied = False
+            if should_adjust_similarity and filtered_recommendations:
+                filtered_recommendations = self._apply_similarity_exponent(
+                    filtered_recommendations,
+                    self.returning_without_history_exponent,
+                )
+                similarity_exponent_applied = True
+
+            filtered_recommendations = self._annotate_overlaps_for_recommendations(
+                filtered_recommendations, badge_id
+            )
+            filtered_count = len(filtered_recommendations)
+
+            if similarity_exponent_applied:
+                exponent_note = (
+                    f"Similarity exponent applied (^{self.returning_without_history_exponent})"
+                )
+                if similarity_adjustment_reason:
+                    exponent_note += (
+                        f" due to {similarity_adjustment_reason.replace('_', ' ')}"
+                    )
+            elif should_adjust_similarity:
+                exponent_note = "Similarity exponent flagged but no recommendations to adjust"
+            elif self.handle_returning_without_history and assist_year_before == "1":
+                exponent_note = "Similarity exponent skipped (past attendance found)"
+            else:
+                exponent_note = "Similarity exponent disabled"
+
+            generation_notes.append(exponent_note)
+            generation_notes.append(f"Filtered to {filtered_count} recommendations")
+
+            overlap_metadata = {
+                "enabled": self.resolve_overlaps_by_similarity,
+                "removed_count": len(removed_overlap_sessions),
+                "removed_sessions": [
+                    rec.get("session_id")
+                    for rec in removed_overlap_sessions
+                    if rec.get("session_id")
+                ],
+            }
+
+            similarity_adjustment_metadata = {
+                "enabled": self.handle_returning_without_history,
+                "flagged": should_adjust_similarity,
+                "applied": similarity_exponent_applied,
+                "exponent": self.returning_without_history_exponent
+                if self.handle_returning_without_history
+                else 1.0,
+                "reason": similarity_adjustment_reason if similarity_adjustment_reason else "",
+            }
+
+            metadata = {
+                "raw_count": raw_count,
+                "filtered_count": filtered_count,
+                "filtering_strategy": filtering_strategy,
+                "generation_strategy": generation_strategy,
+                "notes": generation_notes,
+                "rules_applied": rules_applied,
+                "overlap_resolution": overlap_metadata,
+                "similarity_adjustment": similarity_adjustment_metadata,
+                "custom_rules": custom_rules_metadata,
+            }
+
+            result.update(
+                {
+                    "visitor": visitor,
+                    "raw_recommendations": raw_recommendations,
+                    "filtered_recommendations": filtered_recommendations,
+                    "rules_applied": rules_applied,
+                    "metadata": metadata,
+                }
+            )
+
+            return result
+
         except Exception as e:
             self.logger.error(f"Error generating recommendations for {badge_id}: {str(e)}")
-            return [], {}
+            result["metadata"]["notes"].append("Error while generating recommendations")
+            return result
 
-    def _update_visitor_recommendations(self, recommendations_data: List[Dict]):
-        """Update visitors with has_recommendation flag and create IS_RECOMMENDED relationships."""
+    def _update_visitor_recommendations(
+        self,
+        recommendations_data: List[Dict],
+        control_group_map: Optional[Dict[str, int]] = None,
+    ):
+        """Update visitors with recommendation metadata and control group assignment."""
         try:
             with GraphDatabase.driver(
                 self.uri, auth=(self.username, self.password)
@@ -847,9 +1802,11 @@ class SessionRecommendationProcessor:
                 with driver.session() as session:
                     updated_with_recs = 0
                     updated_without_recs = 0
+                    control_group_map = control_group_map or {}
                     
                     for rec in recommendations_data:
                         visitor_id = rec["visitor"]["BadgeId"]
+                        control_value = control_group_map.get(visitor_id, 0)
                         recommended_sessions = rec.get("filtered_recommendations", [])
                         
                         if recommended_sessions:
@@ -859,12 +1816,14 @@ class SessionRecommendationProcessor:
                             WHERE v.show = $show_name OR v.show IS NULL
                             SET v.has_recommendation = "1",
                                 v.show = $show_name,
-                                v.recommendations_generated_at = $timestamp
+                                v.recommendations_generated_at = $timestamp,
+                                v.{self.control_group_property_name} = $control_group
                             """
                             session.run(update_query, 
                                        visitor_id=visitor_id, 
                                        show_name=self.show_name,
-                                       timestamp=datetime.now().isoformat())
+                                       timestamp=datetime.now().isoformat(),
+                                       control_group=control_value)
                             updated_with_recs += 1
                             
                             # Create IS_RECOMMENDED relationships
@@ -875,6 +1834,7 @@ class SessionRecommendationProcessor:
                                     MATCH (v:{self.visitor_this_year_label} {{BadgeId: $visitor_id}})
                                     WHERE v.show = $show_name
                                     MATCH (s:{self.session_this_year_label} {{session_id: $session_id}})
+                                    WHERE s.title IS NOT NULL AND trim(s.title) <> ''
                                     MERGE (v)-[r:IS_RECOMMENDED]->(s)
                                     SET r.similarity_score = $score,
                                         r.generated_at = $timestamp,
@@ -895,12 +1855,14 @@ class SessionRecommendationProcessor:
                             WHERE v.show = $show_name OR v.show IS NULL
                             SET v.has_recommendation = "0",
                                 v.show = $show_name,
-                                v.recommendations_generated_at = $timestamp
+                                v.recommendations_generated_at = $timestamp,
+                                v.{self.control_group_property_name} = $control_group
                             """
                             session.run(update_query, 
                                        visitor_id=visitor_id, 
                                        show_name=self.show_name,
-                                       timestamp=datetime.now().isoformat())
+                                       timestamp=datetime.now().isoformat(),
+                                       control_group=control_value)
                             updated_without_recs += 1
                     
                     self.logger.info(f"Updated {updated_with_recs} visitors with recommendations, {updated_without_recs} without")
@@ -918,8 +1880,25 @@ class SessionRecommendationProcessor:
                 data = json.load(f)
             
             rows = []
+            # Config-driven additional visitor fields for enrichment
+            extra_fields = self.recommendation_config.get("export_additional_visitor_fields", [])
+            extra_fields = [f for f in extra_fields if isinstance(f, str) and f]
+            # Always include common contact fields if present in visitor profile
+            for f in ["Email", "Forename", "Surname", "Tel", "Mobile"]:
+                if f not in extra_fields:
+                    extra_fields.append(f)
+
             for visitor_id, recs in data.get("recommendations", {}).items():
                 visitor_info = recs.get("visitor", {})
+                metadata = recs.get("metadata", {})
+                notes = metadata.get("notes", [])
+                if isinstance(notes, list):
+                    metadata_list = [str(n) for n in notes if n]
+                elif isinstance(notes, str):
+                    metadata_list = [notes] if notes else []
+                else:
+                    metadata_list = []
+                metadata_summary = json.dumps(metadata_list)
                 
                 for rec in recs.get("filtered_recommendations", []):
                     # Start with basic fields
@@ -935,12 +1914,20 @@ class SessionRecommendationProcessor:
                         col_name = attr_name.replace(" ", "_").replace(".", "")
                         row[col_name] = visitor_info.get(attr_name, "NA")
                     
-                    # Add additional visitor context fields
-                    additional_fields = ["Company", "JobTitle", "Email_domain", "Country", "Source"]
-                    for field in additional_fields:
+                    # Add base context fields (if not part of similarity attributes)
+                    base_context_fields = ["Company", "JobTitle", "Email_domain", "Country", "Source"]
+                    for field in base_context_fields:
                         if field not in self.similarity_attributes:
                             row[field] = visitor_info.get(field, "NA")
+
+                    # Add configured extra enrichment fields (Email, Forename, Surname, Tel, Mobile, etc.)
+                    for field in extra_fields:
+                        # Only add if not already present (avoid overwrite) and value exists
+                        if field not in row:
+                            row[field] = visitor_info.get(field, "NA")
                     
+                    row["overlapping_sessions"] = rec.get("overlapping_sessions", "")
+
                     # Add session recommendation details
                     row.update({
                         "session_id": rec.get("session_id"),
@@ -951,11 +1938,20 @@ class SessionRecommendationProcessor:
                         "session_end_time": rec.get("end_time"),
                         "similarity_score": rec.get("similarity"),
                         "sponsored_by": rec.get("sponsored_by", ""),
+                        "session_theatre_name": rec.get("theatre__name")
+                        or rec.get("theatre_name")
+                        or rec.get("theatre")
+                        or "",
                     })
+
+                    row["recommendation_metadata"] = metadata_summary
                     
                     rows.append(row)
             
             df = pd.DataFrame(rows)
+
+            # Flag overlapping sessions so we can identify concurrent recommendations per visitor
+            df = self._flag_overlapping_sessions(df)
             
             # Reorder columns for better readability
             priority_cols = ["visitor_id", "show", "assist_year_before"]
@@ -963,9 +1959,21 @@ class SessionRecommendationProcessor:
                 attr.replace(" ", "_").replace(".", "") for attr in self.similarity_attributes.keys()
             ]]
             session_cols = [col for col in df.columns if col.startswith("session_")]
-            other_cols = [col for col in df.columns if col not in priority_cols + similarity_cols + session_cols]
+            if "overlapping_sessions" in df.columns:
+                session_cols.append("overlapping_sessions")
+
+            # Keep extra/enrichment fields grouped after priority + similarity
+            enrichment_cols = [c for c in ["Company", "JobTitle", "Email_domain", "Country", "Source"] if c in df.columns]
+            # Append configured extra fields preserving order
+            for f in extra_fields:
+                if f in df.columns and f not in enrichment_cols:
+                    enrichment_cols.append(f)
+
+            # Other cols are anything not already categorized
+            categorized = set(priority_cols + similarity_cols + session_cols + enrichment_cols)
+            other_cols = [c for c in df.columns if c not in categorized]
             
-            ordered_cols = priority_cols + similarity_cols + other_cols + session_cols
+            ordered_cols = priority_cols + similarity_cols + enrichment_cols + other_cols + session_cols
             df = df[[col for col in ordered_cols if col in df.columns]]
             
             return df
@@ -973,6 +1981,373 @@ class SessionRecommendationProcessor:
         except Exception as e:
             self.logger.error(f"Error converting JSON to DataFrame: {str(e)}")
             return pd.DataFrame()
+
+    def _flag_overlapping_sessions(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Annotate each visitor's recommendations with overlapping sessions by time."""
+
+        if df.empty:
+            return df
+
+        # Resolve column names as they appear in the CSV export
+        column_aliases = {
+            "visitor_id": ["visitor_id", "BadgeId", "badgeid"],
+            "session_id": ["session_id"],
+            "session_date": ["session_date", "date"],
+            "session_start_time": ["session_start_time", "start_time"],
+            "session_end_time": ["session_end_time", "end_time"],
+        }
+
+        resolved_cols: Dict[str, str] = {}
+        for logical_name, candidates in column_aliases.items():
+            for candidate in candidates:
+                if candidate in df.columns:
+                    resolved_cols[logical_name] = candidate
+                    break
+
+        required_keys = set(column_aliases.keys())
+        if not required_keys.issubset(resolved_cols.keys()):
+            missing = required_keys - set(resolved_cols.keys())
+            self.logger.warning(
+                "Unable to flag overlapping sessions; missing columns: %s",
+                ", ".join(sorted(missing)),
+            )
+            return df
+
+        df = df.copy()
+
+        session_date_col = resolved_cols["session_date"]
+        start_col = resolved_cols["session_start_time"]
+        end_col = resolved_cols["session_end_time"]
+
+        df["start_datetime"] = pd.to_datetime(
+            df[session_date_col].astype(str) + " " + df[start_col].astype(str),
+            errors="coerce",
+        )
+        df["end_datetime"] = pd.to_datetime(
+            df[session_date_col].astype(str) + " " + df[end_col].astype(str),
+            errors="coerce",
+        )
+
+        overlap_col = "overlapping_sessions"
+        df[overlap_col] = ""
+
+        visitor_col = resolved_cols["visitor_id"]
+        session_id_col = resolved_cols["session_id"]
+
+        for visitor_id, group in df.groupby(visitor_col):
+            if len(group) <= 1:
+                continue
+
+            valid_mask = group["start_datetime"].notna() & group["end_datetime"].notna()
+            group = group[valid_mask]
+            if group.empty:
+                continue
+
+            for idx, row in group.iterrows():
+                current_start = row["start_datetime"]
+                current_end = row["end_datetime"]
+                current_id = row[session_id_col]
+
+                overlaps = group[
+                    (group[session_id_col] != current_id)
+                    & (group["start_datetime"] < current_end)
+                    & (group["end_datetime"] > current_start)
+                ][session_id_col].tolist()
+
+                if overlaps:
+                    df.at[idx, overlap_col] = "|".join(map(str, overlaps))
+
+        df.drop(columns=["start_datetime", "end_datetime"], inplace=True)
+        return df
+
+    def _annotate_overlaps_for_recommendations(
+        self, recommendations: List[Dict], visitor_id: Optional[str] = None
+    ) -> List[Dict]:
+        """Add an overlapping_sessions field to each recommendation entry."""
+
+        if not recommendations:
+            return recommendations
+
+        df = pd.DataFrame(recommendations)
+        if visitor_id is not None and "visitor_id" not in df.columns:
+            df["visitor_id"] = visitor_id
+        df = self._flag_overlapping_sessions(df)
+
+        if "overlapping_sessions" not in df.columns:
+            return [
+                {**rec, "overlapping_sessions": rec.get("overlapping_sessions", "")}
+                for rec in recommendations
+            ]
+
+        overlaps = df["overlapping_sessions"].tolist()
+        annotated: List[Dict] = []
+        for rec, overlap in zip(recommendations, overlaps):
+            value = ""
+            if isinstance(overlap, str) and overlap:
+                value = overlap
+            annotated.append({**rec, "overlapping_sessions": value})
+
+        return annotated
+
+    def _parse_session_interval(self, session: Dict) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+        """Parse session start/end datetimes. Returns None when parsing fails."""
+
+        date_value = session.get("session_date") or session.get("date")
+        start_value = session.get("session_start_time") or session.get("start_time")
+        end_value = session.get("session_end_time") or session.get("end_time")
+
+        if not date_value or not start_value or not end_value:
+            return None
+
+        start_dt = pd.to_datetime(f"{date_value} {start_value}", errors="coerce")
+        end_dt = pd.to_datetime(f"{date_value} {end_value}", errors="coerce")
+
+        if pd.isna(start_dt) or pd.isna(end_dt):
+            return None
+
+        return start_dt, end_dt
+
+    def _resolve_overlapping_recommendations_by_similarity(
+        self, recommendations: List[Dict]
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Remove overlapping sessions keeping the highest similarity entries."""
+
+        if not recommendations:
+            return recommendations, []
+
+        kept: List[Dict] = []
+        removed: List[Dict] = []
+
+        for rec in recommendations:
+            interval = self._parse_session_interval(rec)
+            if interval is None:
+                kept.append(rec)
+                continue
+
+            overlaps_indices: List[int] = []
+            for idx, existing in enumerate(kept):
+                existing_interval = existing.get("_interval")
+                if existing_interval is None:
+                    existing_interval = self._parse_session_interval(existing)
+                    if existing_interval is None:
+                        continue
+                    kept[idx]["_interval"] = existing_interval
+
+                existing_start, existing_end = existing_interval
+                current_start, current_end = interval
+
+                if existing_start < current_end and existing_end > current_start:
+                    overlaps_indices.append(idx)
+
+            if not overlaps_indices:
+                rec_copy = {**rec, "_interval": interval}
+                kept.append(rec_copy)
+                continue
+
+            current_similarity = float(rec.get("similarity", 0) or 0)
+
+            removable_indices: List[int] = []
+            discard_current = False
+
+            for idx in overlaps_indices:
+                existing = kept[idx]
+                existing_similarity = float(existing.get("similarity", 0) or 0)
+
+                if existing_similarity >= current_similarity:
+                    discard_current = True
+                    break
+                removable_indices.append(idx)
+
+            if discard_current:
+                removed.append(rec)
+                continue
+
+            for idx in sorted(removable_indices, reverse=True):
+                removed_entry = kept.pop(idx)
+                removed_entry.pop("_interval", None)
+                removed.append(removed_entry)
+
+            rec_copy = {**rec, "_interval": interval}
+            kept.append(rec_copy)
+
+        for rec in kept:
+            rec.pop("_interval", None)
+
+        kept.sort(key=lambda x: float(x.get("similarity", 0) or 0), reverse=True)
+
+        return kept, removed
+
+    def _apply_similarity_exponent(
+        self, recommendations: List[Dict], exponent: float
+    ) -> List[Dict]:
+        """Raise similarity scores to the given exponent while clamping the result."""
+
+        if not recommendations:
+            return recommendations
+
+        if exponent == 1:
+            return recommendations
+
+        adjusted: List[Dict] = []
+        for rec in recommendations:
+            similarity_value = rec.get("similarity")
+            try:
+                similarity_float = float(similarity_value)
+            except (TypeError, ValueError):
+                adjusted.append(rec)
+                continue
+
+            # Clamp input to sensible bounds before exponentiation
+            similarity_float = max(0.0, min(similarity_float, 1.0))
+            adjusted_similarity = math.pow(similarity_float, exponent)
+            adjusted_similarity = max(0.0, min(adjusted_similarity, 1.0))
+
+            updated_rec = dict(rec)
+            updated_rec["similarity"] = adjusted_similarity
+            adjusted.append(updated_rec)
+
+        return adjusted
+
+    def _apply_custom_recommendation_rules(
+        self, visitor: Dict, sessions: List[Dict]
+    ) -> Tuple[List[Dict], Dict[str, Any]]:
+        """Apply vet-specific custom recommendation rules when configured."""
+
+        if not sessions:
+            return sessions, {"notes": [], "rule_results": []}
+
+        try:
+            adjusted_sessions, summary = (
+                vet_specific_functions.apply_vet_custom_recommendation_rules(
+                    visitor=visitor,
+                    sessions=sessions,
+                    processor=self,
+                    rules_config=self.custom_rules_config,
+                )
+            )
+
+            if not isinstance(summary, dict):
+                summary = {"notes": [], "rule_results": []}
+
+            if "notes" not in summary or not isinstance(summary["notes"], list):
+                summary["notes"] = []
+            if "rule_results" not in summary or not isinstance(summary["rule_results"], list):
+                summary["rule_results"] = []
+
+            return adjusted_sessions, summary
+
+        except Exception as exc:
+            self.logger.error(
+                "Error applying custom recommendation rules: %s", str(exc), exc_info=True
+            )
+            return sessions, {
+                "notes": [f"Custom rule processing error: {exc}"],
+                "rule_results": [],
+                "error": str(exc),
+            }
+
+    def _should_apply_control_group(self) -> bool:
+        """Determine if the control group logic should run for the current execution."""
+
+        if not self.control_group_enabled:
+            return False
+
+        if self.control_group_percentage <= 0:
+            return False
+
+        return self.mode == "personal_agendas"
+
+    def _split_control_group(
+        self, recommendations: Dict[str, Dict[str, Any]]
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, Any], Dict[str, int]]:
+        """
+        Split visitors into primary and control groups.
+
+        Returns:
+            remaining: Visitors to keep in the main output
+            control: Visitors held out for the control group
+            summary: Metadata about the allocation
+            assignment: Mapping of visitor_id -> 1 (control) or 0 (primary)
+        """
+
+        remaining: Dict[str, Dict[str, Any]] = {}
+        control: Dict[str, Dict[str, Any]] = {}
+        assignment: Dict[str, int] = {}
+
+        if not recommendations:
+            return remaining, control, {
+                "enabled": self._should_apply_control_group(),
+                "applied": False,
+                "percentage": self.control_group_percentage,
+                "selected_visitors": 0,
+                "eligible_visitors": 0,
+                "mode": self.mode,
+                "random_seed": self.control_group_random_seed,
+            }, assignment
+
+        eligible_ids = [
+            visitor_id
+            for visitor_id, payload in recommendations.items()
+            if payload.get("filtered_recommendations")
+        ]
+
+        summary = {
+            "enabled": self._should_apply_control_group(),
+            "applied": False,
+            "percentage": self.control_group_percentage,
+            "selected_visitors": 0,
+            "eligible_visitors": len(eligible_ids),
+            "mode": self.mode,
+            "random_seed": self.control_group_random_seed,
+        }
+
+        selected_ids: Set[str] = set()
+        if self._should_apply_control_group() and eligible_ids:
+            target_count = max(1, int(round(len(eligible_ids) * self.control_group_percentage)))
+            target_count = min(target_count, len(eligible_ids))
+
+            rng = random.Random(self.control_group_random_seed)
+            selected_ids = set(rng.sample(eligible_ids, target_count))
+            summary["applied"] = bool(selected_ids)
+            summary["selected_visitors"] = len(selected_ids)
+        else:
+            summary["enabled"] = False
+
+        for visitor_id, payload in recommendations.items():
+            if visitor_id in selected_ids:
+                control[visitor_id] = payload
+                assignment[visitor_id] = 1
+            else:
+                remaining[visitor_id] = payload
+                assignment[visitor_id] = 0
+
+        if summary["applied"]:
+            self.logger.info(
+                "Control group enabled: withholding %d of %d eligible visitors (%.2f%% configured)",
+                summary["selected_visitors"],
+                summary["eligible_visitors"],
+                self.control_group_percentage * 100,
+            )
+        elif summary["enabled"]:
+            self.logger.info(
+                "Control group configuration enabled but no eligible visitors were selected"
+            )
+
+        return remaining, control, summary, assignment
+
+    def _get_control_output_path(self, base_output_file: Path) -> Path:
+        """Build the path for the control group export file."""
+
+        if self.control_group_output_directory:
+            candidate = Path(self.control_group_output_directory)
+            if not candidate.is_absolute():
+                candidate = self.output_dir / candidate
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate / f"{base_output_file.stem}{self.control_group_file_suffix}{base_output_file.suffix}"
+
+        return base_output_file.with_name(
+            f"{base_output_file.stem}{self.control_group_file_suffix}{base_output_file.suffix}"
+        )
 
     def process(self, create_only_new: bool = False):
         """
@@ -991,17 +2366,23 @@ class SessionRecommendationProcessor:
             visitors_to_process = self._get_visitors_to_process(create_only_new)
             
             if not visitors_to_process:
+                # Ensure summary utilities have the expected alias key even when nothing processed
+                self.statistics["visitors_processed"] = 0
+                self.statistics["total_visitors_processed"] = 0
                 self.logger.info("No visitors to process for recommendations.")
                 return
             
             self.statistics["visitors_processed"] = len(visitors_to_process)
+            # Reset run-scoped counters so repeated runs remain accurate
+            self.statistics["visitors_with_recommendations"] = 0
+            self.statistics["visitors_without_recommendations"] = 0
+            self.statistics["total_recommendations_generated"] = 0
+            self.statistics["total_filtered_recommendations"] = 0
+            self.statistics["unique_recommended_sessions"] = 0
             
             # Process visitors and generate recommendations
             all_recommendations = []
-            successful = 0
             errors = 0
-            total_recommendations = 0
-            unique_sessions = set()
             
             # Create output file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1016,131 +2397,230 @@ class SessionRecommendationProcessor:
                     self.logger.info(f"Processing visitor {i}/{len(visitors_to_process)}")
                 
                 try:
-                    recommendations, visitor = self.generate_recommendations_for_visitor(badge_id)
-                    
-                    if recommendations:
-                        # Apply filtering if configured
-                        if self.enable_filtering:
-                            filtered_recommendations, rules_applied = self.filter_sessions(
-                                visitor, recommendations
-                            )
-                        else:
-                            filtered_recommendations = recommendations
-                            rules_applied = []
-                        
-                        self.statistics["total_filtered_recommendations"] += len(filtered_recommendations)
-                        
-                        if filtered_recommendations:
-                            self.statistics["visitors_with_recommendations"] += 1
-                            successful += 1
-                            total_recommendations += len(filtered_recommendations)
-                            
-                            for rec in filtered_recommendations:
-                                unique_sessions.add(rec["session_id"])
-                            
-                            all_recommendations.append({
-                                "visitor": visitor,
-                                "raw_recommendations": recommendations,
-                                "filtered_recommendations": filtered_recommendations,
-                                "metadata": {
-                                    "rules_applied": rules_applied,
-                                    "raw_count": len(recommendations),
-                                    "filtered_count": len(filtered_recommendations),
-                                }
-                            })
-                            
-                            recommendations_dict[badge_id] = {
-                                "visitor": visitor,
-                                "filtered_recommendations": filtered_recommendations,
-                                "rules_applied": rules_applied
-                            }
-                            
-                            self.logger.debug(
-                                f"Generated {len(filtered_recommendations)} recommendations for visitor {badge_id}"
-                            )
-                        else:
-                            self.statistics["visitors_without_recommendations"] += 1
-                            # Still mark as processed even without recommendations
-                            all_recommendations.append({
-                                "visitor": visitor,
-                                "raw_recommendations": [],
-                                "filtered_recommendations": [],
-                                "metadata": {
-                                    "rules_applied": [],
-                                    "raw_count": 0,
-                                    "filtered_count": 0,
-                                }
-                            })
+                    visitor_payload = self.generate_recommendations_for_visitor(badge_id)
+                    visitor = visitor_payload.get("visitor", {})
+                    raw_recommendations = visitor_payload.get("raw_recommendations", [])
+                    filtered_recommendations = visitor_payload.get("filtered_recommendations", [])
+                    rules_applied = visitor_payload.get("rules_applied", [])
+                    metadata = visitor_payload.get("metadata", {})
+                    metadata.setdefault("raw_count", len(raw_recommendations))
+                    metadata.setdefault("filtered_count", len(filtered_recommendations))
+                    filtered_count = metadata.get("filtered_count", len(filtered_recommendations))
+
+                    payload_for_storage = {
+                        "visitor": visitor,
+                        "raw_recommendations": raw_recommendations,
+                        "filtered_recommendations": filtered_recommendations,
+                        "metadata": metadata,
+                        "rules_applied": rules_applied,
+                    }
+
+                    can_update_neo4j = bool(visitor.get("BadgeId"))
+
+                    if filtered_recommendations:
+                        if can_update_neo4j:
+                            all_recommendations.append(payload_for_storage)
+                        recommendations_dict[badge_id] = payload_for_storage
+
+                        self.logger.debug(
+                            f"Generated {filtered_count} recommendations for visitor {badge_id}"
+                        )
                     else:
-                        self.statistics["visitors_without_recommendations"] += 1
-                        # Mark visitor as processed even without recommendations
-                        all_recommendations.append({
-                            "visitor": visitor,
-                            "raw_recommendations": [],
-                            "filtered_recommendations": [],
-                            "metadata": {
-                                "rules_applied": [],
-                                "raw_count": 0,
-                                "filtered_count": 0,
-                            }
-                        })
+                        if can_update_neo4j:
+                            all_recommendations.append(payload_for_storage)
+                        recommendations_dict[badge_id] = payload_for_storage
+                        
+                        if not visitor:
+                            errors += 1
+                            self.statistics["errors"] += 1
+                            self.statistics["error_details"].append(
+                                f"{badge_id}: visitor context missing"
+                            )
+                            self.logger.error(
+                                f"Visitor context missing for badge {badge_id}; unable to update Neo4j"
+                            )
                         
                 except Exception as e:
                     errors += 1
                     self.statistics["errors"] += 1
                     self.statistics["error_details"].append(f"{badge_id}: {str(e)}")
                     self.logger.error(f"Error processing visitor {badge_id}: {str(e)}")
-            
-            # Update statistics
-            self.statistics["total_recommendations_generated"] = total_recommendations
-            self.statistics["unique_recommended_sessions"] = len(unique_sessions)
-            
+
+            theatre_stats = None
+            if self.theatre_limits_enabled:
+                theatre_stats = self._enforce_theatre_capacity_limits(recommendations_dict)
+                if theatre_stats and theatre_stats.get("recommendations_removed", 0):
+                    self.logger.info(
+                        "Applied theatre capacity limits: removed %s recommendations across %s slot(s)",
+                        theatre_stats.get("recommendations_removed", 0),
+                        theatre_stats.get("slots_limited", 0),
+                    )
+
+            # Ensure metadata counts stay aligned with final recommendation lists
+            for payload in recommendations_dict.values():
+                metadata = payload.get("metadata")
+                if metadata is not None:
+                    metadata["filtered_count"] = len(payload.get("filtered_recommendations", []) or [])
+
+            total_recommendations_all = 0
+            unique_sessions_all: Set[Any] = set()
+            successful_total = 0
+            for payload in recommendations_dict.values():
+                recs = payload.get("filtered_recommendations", []) or []
+                total_recommendations_all += len(recs)
+                if recs:
+                    successful_total += 1
+                for rec in recs:
+                    session_id = rec.get("session_id")
+                    if session_id:
+                        unique_sessions_all.add(session_id)
+
+            visitors_without = len(visitors_to_process) - successful_total
+
+            # Update statistics post-enforcement with overall totals
+            self.statistics["visitors_with_recommendations"] = successful_total
+            self.statistics["visitors_without_recommendations"] = max(visitors_without, 0)
+            self.statistics["total_recommendations_generated"] = total_recommendations_all
+            self.statistics["total_filtered_recommendations"] = total_recommendations_all
+            self.statistics["unique_recommended_sessions"] = len(unique_sessions_all)
+            if theatre_stats:
+                self.statistics["theatre_capacity_limits"] = theatre_stats
+            else:
+                self.statistics.pop("theatre_capacity_limits", None)
+
             # Add alias for backward compatibility with summary_utils
             self.statistics["total_visitors_processed"] = self.statistics["visitors_processed"]
-            self.statistics["unique_recommended_sessions"] = len(unique_sessions)
-            
-            # Save recommendations to file
-            output_data = {
-                "metadata": {
-                    "generated_at": datetime.now().isoformat(),
-                    "show": self.show_name,
-                    "visitors_processed": len(visitors_to_process),
-                    "successful": successful,
-                    "errors": errors,
-                    "total_recommendations": total_recommendations,
-                    "unique_sessions": len(unique_sessions),
-                    "filtering_enabled": self.enable_filtering,
-                    "create_only_new": create_only_new,
-                    "configuration": {
-                        "min_similarity_score": self.min_similarity_score,
-                        "max_recommendations": self.max_recommendations,
-                        "similar_visitors_count": self.similar_visitors_count,
-                    }
+
+            (
+                recommendations_dict,
+                control_recommendations,
+                control_summary,
+                control_assignment_map,
+            ) = self._split_control_group(recommendations_dict)
+
+            main_total_recommendations = 0
+            main_unique_sessions: Set[Any] = set()
+            main_successful = 0
+            for payload in recommendations_dict.values():
+                recs = payload.get("filtered_recommendations", []) or []
+                main_total_recommendations += len(recs)
+                if recs:
+                    main_successful += 1
+                for rec in recs:
+                    session_id = rec.get("session_id")
+                    if session_id:
+                        main_unique_sessions.add(session_id)
+
+            control_total_recommendations = 0
+            control_unique_sessions: Set[Any] = set()
+            control_successful = 0
+            for payload in control_recommendations.values():
+                recs = payload.get("filtered_recommendations", []) or []
+                control_total_recommendations += len(recs)
+                if recs:
+                    control_successful += 1
+                for rec in recs:
+                    session_id = rec.get("session_id")
+                    if session_id:
+                        control_unique_sessions.add(session_id)
+
+            control_summary["withheld_visitors"] = len(control_recommendations)
+            control_summary["withheld_recommendations"] = control_total_recommendations
+            control_summary["withheld_successful"] = control_successful
+
+            self.statistics["control_group"] = control_summary
+
+            output_metadata = {
+                "generated_at": datetime.now().isoformat(),
+                "show": self.show_name,
+                "visitors_processed": len(visitors_to_process),
+                "successful": main_successful,
+                "successful_before_control": successful_total,
+                "errors": errors,
+                "total_recommendations": main_total_recommendations,
+                "total_recommendations_before_control": total_recommendations_all,
+                "unique_sessions": len(main_unique_sessions),
+                "filtering_enabled": self.enable_filtering,
+                "create_only_new": create_only_new,
+                "control_group": control_summary,
+                "configuration": {
+                    "min_similarity_score": self.min_similarity_score,
+                    "max_recommendations": self.max_recommendations,
+                    "similar_visitors_count": self.similar_visitors_count,
+                    "theatre_capacity_enforced": self.theatre_limits_enabled,
+                    "theatre_capacity_multiplier": self.theatre_capacity_multiplier
+                    if self.theatre_limits_enabled
+                    else None,
                 },
+            }
+
+            # Update Neo4j before writing any outputs so control visitors stay tracked in graph
+            if all_recommendations:
+                self.logger.info("Updating Neo4j with recommendation data")
+                self._update_visitor_recommendations(all_recommendations, control_assignment_map)
+                self.logger.info("Completed Neo4j updates")
+
+            # Save recommendations to file (primary dataset)
+            output_data = {
+                "metadata": output_metadata,
+                "theatre_capacity_stats": theatre_stats,
                 "recommendations": recommendations_dict,
                 "statistics": self.statistics,
             }
-            
+
             with open(output_file, "w") as f:
                 json.dump(output_data, f, indent=2, default=str)
-            
+
             self.logger.info(f"Saved recommendations to {output_file}")
             self.logger.info(
-                f"Generated recommendations for {successful} visitors with {errors} errors"
+                "Generated recommendations for %d visitors (%d withheld for control) with %d errors",
+                main_successful,
+                control_summary.get("withheld_visitors", 0),
+                errors,
             )
-            
+
             # Save as CSV if configured
             if self.recommendation_config.get("save_csv", True):
                 df = self.json_to_dataframe(output_file)
                 csv_file = str(output_file).replace(".json", ".csv")
                 df.to_csv(csv_file, index=False)
                 self.logger.info(f"Saved recommendations DataFrame to {csv_file}")
-            
-            # Update Neo4j with recommendations
-            if len(all_recommendations) > 0:
-                self.logger.info("Updating Neo4j with recommendation data")
-                self._update_visitor_recommendations(all_recommendations)
-                self.logger.info("Completed Neo4j updates")
+
+            # Persist control group outputs separately when applicable
+            if control_recommendations:
+                control_output_file = self._get_control_output_path(output_file)
+                control_metadata = {
+                    "generated_at": output_metadata["generated_at"],
+                    "show": self.show_name,
+                    "visitors_processed": len(visitors_to_process),
+                    "successful": control_successful,
+                    "errors": errors,
+                    "total_recommendations": control_total_recommendations,
+                    "unique_sessions": len(control_unique_sessions),
+                    "filtering_enabled": self.enable_filtering,
+                    "create_only_new": create_only_new,
+                    "control_group_dataset": True,
+                    "control_group": control_summary,
+                    "configuration": output_metadata["configuration"],
+                }
+
+                control_output = {
+                    "metadata": control_metadata,
+                    "theatre_capacity_stats": theatre_stats,
+                    "recommendations": control_recommendations,
+                    "statistics": self.statistics,
+                }
+
+                with open(control_output_file, "w") as f:
+                    json.dump(control_output, f, indent=2, default=str)
+
+                self.logger.info("Saved control group recommendations to %s", control_output_file)
+
+                if self.recommendation_config.get("save_csv", True):
+                    df_control = self.json_to_dataframe(control_output_file)
+                    control_csv = str(control_output_file).replace(".json", ".csv")
+                    df_control.to_csv(control_csv, index=False)
+                    self.logger.info("Saved control group DataFrame to %s", control_csv)
             
             # Calculate processing time
             self.statistics["processing_time"] = time.time() - start_time

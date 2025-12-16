@@ -56,6 +56,38 @@ def setup_neo4j_schema(config):
         # Create indexes for common lookup fields
         create_indexes(neo4j_conn, config)
 
+        # Additional safety constraints: ensure session_id uniqueness and non-empty titles on sessions
+        try:
+            session_this = config["neo4j"]["node_labels"]["session_this_year"]
+            session_past = config["neo4j"]["node_labels"]["session_past_year"]
+
+            # Unique session_id (if not already present)
+            neo4j_conn.execute_query(
+                f"CREATE CONSTRAINT IF NOT EXISTS FOR (s:{session_this}) REQUIRE s.session_id IS UNIQUE",
+                {},
+                write=True,
+            )
+            neo4j_conn.execute_query(
+                f"CREATE CONSTRAINT IF NOT EXISTS FOR (s:{session_past}) REQUIRE s.session_id IS UNIQUE",
+                {},
+                write=True,
+            )
+
+            # Non-null title constraints (Neo4j 5+ allows existence constraints)
+            neo4j_conn.execute_query(
+                f"CREATE CONSTRAINT IF NOT EXISTS FOR (s:{session_this}) REQUIRE s.title IS NOT NULL",
+                {},
+                write=True,
+            )
+            neo4j_conn.execute_query(
+                f"CREATE CONSTRAINT IF NOT EXISTS FOR (s:{session_past}) REQUIRE s.title IS NOT NULL",
+                {},
+                write=True,
+            )
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Optional session constraints could not be created (compatibility): {e}")
+
         logger.info("Neo4j schema setup complete")
     except Exception as e:
         logger.error(f"Error setting up Neo4j schema: {e}", exc_info=True)

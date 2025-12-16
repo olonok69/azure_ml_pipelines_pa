@@ -645,6 +645,19 @@ def main(args):
         raise
 
 
+def _bool_arg(value: Optional[str]) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    value_str = str(value).strip().lower()
+    if value_str in {"true", "1", "yes", "y"}:
+        return True
+    if value_str in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected for incremental flag")
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Azure ML Neo4j Preparation Step')
@@ -658,8 +671,11 @@ def parse_args():
     
     parser.add_argument(
         '--incremental',
-        action='store_true',
-        help='Run in incremental mode (only create new nodes/relationships)'
+        nargs='?',
+        const=True,
+        default=False,
+        type=_bool_arg,
+        help='Run in incremental mode (accepts true/false)'
     )
     
     # Input paths from Step 1

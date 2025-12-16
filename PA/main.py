@@ -41,6 +41,44 @@ def configure_azure_logging():
         azure_logger.setLevel(logging.WARNING)  # Only show warnings and errors
 
 
+def log_documentation_assets(config, logger, mlflow_manager=None):
+    """Log documentation metadata and upload SVG assets when available."""
+    doc_cfg = config.get("documentation")
+    if not doc_cfg:
+        logger.info("No documentation assets declared in configuration")
+        return
+
+    logged_artifacts = set()
+
+    for label, doc_path in doc_cfg.items():
+        if not doc_path:
+            continue
+
+        resolved_path = os.path.abspath(doc_path)
+        exists = os.path.exists(resolved_path)
+        status = "found" if exists else "missing"
+        logger.info(
+            "Documentation asset '%s': %s (%s)",
+            label,
+            doc_path,
+            status,
+        )
+
+        if mlflow_manager:
+            mlflow_manager.log_param(f"documentation_{label}", doc_path)
+            if exists and resolved_path not in logged_artifacts:
+                try:
+                    mlflow.log_artifact(resolved_path)
+                    logged_artifacts.add(resolved_path)
+                    logger.info("Uploaded documentation artifact for '%s'", label)
+                except Exception as artifact_error:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Could not upload documentation asset '%s': %s",
+                        label,
+                        artifact_error,
+                    )
+
+
 def log_neo4j_step_metrics(mlflow_manager, processors, step_number):
     """
     Log metrics for specific Neo4j processing steps.
@@ -82,10 +120,14 @@ def log_neo4j_step_metrics(mlflow_manager, processors, step_number):
                             step_metrics[f'{metric_prefix}_nodes_created'] = sum(stats['nodes_created'].values())
                         if 'nodes_skipped' in stats:
                             step_metrics[f'{metric_prefix}_nodes_skipped'] = sum(stats['nodes_skipped'].values())
+                        if 'nodes_updated' in stats:
+                            step_metrics[f'{metric_prefix}_nodes_updated'] = sum(stats['nodes_updated'].values())
                     
                     elif step_number == 5:  # Neo4j Session
                         if 'nodes_created' in stats:
                             step_metrics[f'{metric_prefix}_nodes_created'] = sum(stats['nodes_created'].values())
+                        if 'nodes_skipped' in stats:
+                            step_metrics[f'{metric_prefix}_nodes_skipped'] = sum(stats['nodes_skipped'].values())
                         if 'relationships_created' in stats:
                             step_metrics[f'{metric_prefix}_relationships_created'] = sum(stats['relationships_created'].values())
                     
@@ -97,6 +139,9 @@ def log_neo4j_step_metrics(mlflow_manager, processors, step_number):
                     elif step_number == 8:  # Visitor Relationships
                         if 'relationships_created' in stats:
                             step_metrics[f'{metric_prefix}_relationships_created'] = sum(stats['relationships_created'].values())
+                            assisted_value = stats['relationships_created'].get('assisted_session_this_year')
+                            if assisted_value is not None:
+                                step_metrics[f'{metric_prefix}_assisted_session_this_year_created'] = assisted_value
                         if 'relationships_failed' in stats:
                             step_metrics[f'{metric_prefix}_relationships_failed'] = sum(stats['relationships_failed'].values())
                     
@@ -187,8 +232,8 @@ def main():
             logger.info(f"Started MLflow run: {run_id}")
             
             # ADDED: Log command line arguments
-            mlflow.log_param("command_line_args", str(vars(args)))
-            mlflow.log_param("config_file", args.config)
+            mlflow_manager.log_param("command_line_args", str(vars(args)))
+            mlflow_manager.log_param("config_file", args.config)
             
         except Exception as e:
             logger.warning(f"Could not initialize MLflow: {e}. Continuing without MLflow tracking.")
@@ -197,6 +242,9 @@ def main():
             mlflow_manager = None
     else:
         logger.info("MLflow tracking is disabled (--skip-mlflow flag)")
+
+    # Surface documentation assets via logs and MLflow params/artifacts
+    log_documentation_assets(config, logger, mlflow_manager)
 
     # Get create_only_new from config, but allow command line to override
     if args.recreate_all:
@@ -208,8 +256,8 @@ def main():
     
     # Log initial pipeline parameters to MLflow
     if mlflow_manager:
-        mlflow.log_param("create_only_new", create_only_new)
-        mlflow.log_param("skip_neo4j", args.skip_neo4j)
+        mlflow_manager.log_param("create_only_new", create_only_new)
+        mlflow_manager.log_param("skip_neo4j", args.skip_neo4j)
 
     try:
         # Determine which steps to run
@@ -217,7 +265,8 @@ def main():
         if args.only_steps:
             steps_to_run = [int(step.strip()) for step in args.only_steps.split(",")]
             if mlflow_manager:
-                mlflow.log_param("steps_to_run", str(steps_to_run))
+                mlflow_manager.log_param("steps_to_run", str(steps_to_run))
+            logger.info(f"User-specified steps_to_run: {steps_to_run}")
 
         # If only recommendations flag is set, only run step 10
         if args.only_recommendations:
@@ -233,7 +282,7 @@ def main():
             if mlflow_manager:
                 log_neo4j_step_metrics(mlflow_manager, processors, 10)
                 mlflow_manager.log_summary_metrics(processors)
-                mlflow.log_param("steps_run", "10")
+                mlflow_manager.log_param("steps_run", "10")
             
             generate_and_save_summary(processors, skip_neo4j=True)
             logger.info("Session recommendation processing completed successfully")
@@ -241,7 +290,7 @@ def main():
             # End MLflow run
             if mlflow_manager:
                 processing_time = (datetime.now() - pipeline_start_time).total_seconds()
-                mlflow.log_metric("total_processing_time_seconds", processing_time)
+                mlflow_manager.log_metric("total_processing_time_seconds", processing_time)
                 mlflow_manager.end_run(status="FINISHED")
                 logger.info(f"MLflow run completed. Run ID: {run_id}")
             
@@ -262,7 +311,7 @@ def main():
                 # Log step timing
                 if mlflow_manager:
                     step_time = (datetime.now() - step_start).total_seconds()
-                    mlflow.log_metric("step1_registration_time_seconds", step_time)
+                    mlflow_manager.log_metric("step1_registration_time_seconds", step_time)
                 
                 steps_completed.append(1)
                 logger.info("Completed step 1: Registration data processing")
@@ -280,7 +329,7 @@ def main():
                 # Log step timing
                 if mlflow_manager:
                     step_time = (datetime.now() - step_start).total_seconds()
-                    mlflow.log_metric("step2_scan_time_seconds", step_time)
+                    mlflow_manager.log_metric("step2_scan_time_seconds", step_time)
                 
                 steps_completed.append(2)
                 logger.info("Completed step 2: Scan data processing")
@@ -298,7 +347,7 @@ def main():
                 # Log step timing
                 if mlflow_manager:
                     step_time = (datetime.now() - step_start).total_seconds()
-                    mlflow.log_metric("step3_session_time_seconds", step_time)
+                    mlflow_manager.log_metric("step3_session_time_seconds", step_time)
                 
                 steps_completed.append(3)
                 logger.info("Completed step 3: Session data processing")
@@ -329,6 +378,37 @@ def main():
                 if config.get("pipeline_steps", {}).get("session_recommendation_processing", True):
                     neo4j_steps_to_run.append(10)
 
+            # Pre-execution diagnostic matrix of Neo4j steps
+            neo4j_step_names = {
+                4: "Neo4j Visitor",
+                5: "Neo4j Session",
+                6: "Neo4j Job->Stream",
+                7: "Neo4j Specialization->Stream",
+                8: "Neo4j Visitor Relationships",
+                9: "Session Embeddings",
+                10: "Session Recommendations"
+            }
+            logger.info("Neo4j step selection summary:")
+            for s in range(4, 11):
+                enabled = config.get("pipeline_steps", {}).get({
+                    4:"neo4j_visitor_processing",
+                    5:"neo4j_session_processing",
+                    6:"neo4j_job_stream_processing",
+                    7:"neo4j_specialization_stream_processing",
+                    8:"neo4j_visitor_relationship_processing",
+                    9:"session_embedding_processing",
+                    10:"session_recommendation_processing"
+                }[s], True)
+                selected = s in neo4j_steps_to_run
+                status = ("RUN" if (enabled and selected) else
+                          "DISABLED" if not enabled else
+                          "NOT_SELECTED")
+                logger.info(f"  Step {s}: {neo4j_step_names[s]:32} -> {status}")
+            if create_only_new:
+                logger.info("Neo4j session processing will run in INCREMENTAL mode (create_only_new=True)")
+            else:
+                logger.info("Neo4j session processing will run in FULL REBUILD mode (create_only_new=False)")
+
             if neo4j_steps_to_run:
                 logger.info("Starting Neo4j data processing")
                 neo4j_start = datetime.now()
@@ -344,7 +424,7 @@ def main():
                     # Log metrics for this specific step
                     if mlflow_manager:
                         step_time = (datetime.now() - step_start).total_seconds()
-                        mlflow.log_metric(f"step{step_num}_time_seconds", step_time)
+                        mlflow_manager.log_metric(f"step{step_num}_time_seconds", step_time)
                         log_neo4j_step_metrics(mlflow_manager, processors, step_num)
                     
                     steps_completed.append(step_num)
@@ -352,7 +432,7 @@ def main():
                 # Log Neo4j processing time
                 if mlflow_manager:
                     neo4j_time = (datetime.now() - neo4j_start).total_seconds()
-                    mlflow.log_metric("neo4j_total_time_seconds", neo4j_time)
+                    mlflow_manager.log_metric("neo4j_total_time_seconds", neo4j_time)
                 
                 logger.info("Completed Neo4j data processing")
             else:
@@ -446,15 +526,15 @@ def main():
         # Log all summary metrics to MLflow
         if mlflow_manager:
             # Log which processors were run
-            mlflow.log_param("processors_run", ", ".join(processors.keys()))
-            mlflow.log_param("steps_completed", str(steps_completed))
+            mlflow_manager.log_param("processors_run", ", ".join(processors.keys()))
+            mlflow_manager.log_param("steps_completed", str(steps_completed))
             
             # Log comprehensive summary metrics from all processors
             mlflow_manager.log_summary_metrics(processors)
             
             # Log total processing time
             total_time = (datetime.now() - pipeline_start_time).total_seconds()
-            mlflow.log_metric("total_processing_time_seconds", total_time)
+            mlflow_manager.log_metric("total_processing_time_seconds", total_time)
             
             # Try to log summary file and extract additional metrics
             summary_json_path = "logs/processing_summary.json"
@@ -492,8 +572,8 @@ def main():
         
         # Log failure to MLflow if enabled
         if mlflow_manager:
-            mlflow.log_param("error_message", str(e))
-            mlflow.log_metric("total_processing_time_seconds", (datetime.now() - pipeline_start_time).total_seconds())
+            mlflow_manager.log_param("error_message", str(e))
+            mlflow_manager.log_metric("total_processing_time_seconds", (datetime.now() - pipeline_start_time).total_seconds())
             mlflow_manager.end_run(status="FAILED")
         
         print(f"Error: {e}")

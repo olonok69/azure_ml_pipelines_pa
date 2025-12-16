@@ -1,9 +1,7 @@
 import os
 import logging
 import pandas as pd
-import string
-import json
-from typing import Dict, List, Set, Tuple
+from typing import Dict
 
 from pandas.errors import SettingWithCopyWarning
 import warnings
@@ -21,6 +19,7 @@ class ScanProcessor:
         """
         self.config = config
         self.output_dir = config.get("output_dir", "output")
+        self.mode = config.get("mode", "personal_agendas")
         
         # Get event configuration
         self.event_config = config.get("event", {})
@@ -28,6 +27,11 @@ class ScanProcessor:
         # Get event names
         self.main_event_name = self.event_config.get("main_event_name", "main")
         self.secondary_event_name = self.event_config.get("secondary_event_name", "secondary")
+
+        # Post analysis mode configuration (optional)
+        self.post_analysis_config = config.get("post_analysis_mode", {}) if self.mode == "post_analysis" else {}
+        self.enhanced_seminars_df_this_year = pd.DataFrame()
+        self.seminars_scans_this_year_enhanced = pd.DataFrame()
         
         # Get output file configurations with backward compatibility
         self.output_files = config.get("scan_output_files", {})
@@ -100,6 +104,23 @@ class ScanProcessor:
             self.seminars_scan_reference_past_lva = self.seminars_scan_reference_past_secondary
             self.seminars_scans_past_lva = self.seminars_scans_past_secondary
 
+            # Load post analysis seminar files (this year) if configured
+            if self.mode == "post_analysis":
+                pa_scan_files = self.post_analysis_config.get("scan_files", {})
+                seminars_scan_reference_this_path = pa_scan_files.get("seminars_scan_reference_this")
+                seminars_scans_this_path = pa_scan_files.get("seminars_scans_this")
+
+                if seminars_scan_reference_this_path and seminars_scans_this_path:
+                    self.seminars_scan_reference_this_year = pd.read_csv(seminars_scan_reference_this_path)
+                    self.seminars_scans_this_year = pd.read_csv(seminars_scans_this_path)
+                    self.logger.info(
+                        f"Loaded post-analysis seminar scans for this year: reference={len(self.seminars_scan_reference_this_year)} records, scans={len(self.seminars_scans_this_year)} records"
+                    )
+                else:
+                    self.logger.warning("Post-analysis scan files not fully configured; skipping this-year seminar load")
+                    self.seminars_scan_reference_this_year = pd.DataFrame()
+                    self.seminars_scans_this_year = pd.DataFrame()
+
             self.logger.info(
                 f"Loaded session data: {len(self.session_this)} records this year, "
                 f"{len(self.session_past_main)} {self.main_event_name} records last year, "
@@ -145,6 +166,25 @@ class ScanProcessor:
                 reg_with_demo_files.get("last_year_secondary", "Registration_data_with_demographicdata_lva_last.csv"),
             )
 
+            # Load this-year files for post analysis mode
+            if self.mode == "post_analysis":
+                this_year_combined_path = os.path.join(
+                    self.output_dir,
+                    "output",
+                    combined_output_files.get("this_year", "df_reg_demo_this.csv")
+                )
+                this_year_detailed_path = os.path.join(
+                    self.output_dir,
+                    "output",
+                    reg_with_demo_files.get("this_year", "Registration_data_with_demographicdata_bva_this.csv")
+                )
+
+                self.reg_data_this_year = pd.read_csv(this_year_combined_path)
+                self.df_reg_wdemo_this_year = pd.read_csv(this_year_detailed_path)
+            else:
+                self.reg_data_this_year = pd.DataFrame()
+                self.df_reg_wdemo_this_year = pd.DataFrame()
+
             # Read registration data
             self.reg_data_last_main = pd.read_csv(reg_data_last_main_path)
             self.reg_data_last_secondary = pd.read_csv(reg_data_last_secondary_path)
@@ -167,6 +207,11 @@ class ScanProcessor:
                 f"Loaded detailed registration data: {len(self.df_reg_24_wdemo_data_main)} {self.main_event_name} records, "
                 f"{len(self.df_reg_24_wdemo_data_secondary)} {self.secondary_event_name} records"
             )
+
+            if self.mode == "post_analysis":
+                self.logger.info(
+                    f"Loaded this-year registration data for post analysis: combined={len(self.reg_data_this_year)} records, detailed={len(self.df_reg_wdemo_this_year)} records"
+                )
 
         except Exception as e:
             self.logger.error(f"Error loading registration data: {e}", exc_info=True)
@@ -230,6 +275,25 @@ class ScanProcessor:
                 self.clean_text
             )
 
+            if self.mode == "post_analysis" and hasattr(self, "seminars_scans_this_year") and not self.seminars_scans_this_year.empty:
+                self.seminars_scans_this_year_enhanced = pd.merge(
+                    self.seminars_scans_this_year,
+                    self.seminars_scan_reference_this_year[["Short Name", "Seminar Name"]],
+                    on=["Short Name"],
+                    how="left",
+                )
+                self.seminars_scans_this_year_enhanced["key_text"] = (
+                    self.seminars_scans_this_year_enhanced["Seminar Name"].apply(self.clean_text)
+                )
+                # Align session key text
+                if "key_text" not in self.session_this.columns:
+                    self.session_this["key_text"] = self.session_this["title"].apply(self.clean_text)
+                self.logger.info(
+                    f"Enhanced post-analysis seminar data with {len(self.seminars_scans_this_year_enhanced)} this-year records"
+                )
+            else:
+                self.seminars_scans_this_year_enhanced = pd.DataFrame()
+
             self.logger.info(
                 f"Enhanced seminar data with seminar names: {len(self.seminars_scans_past_enhanced_main)} {self.main_event_name} records, "
                 f"{len(self.seminars_scans_past_enhanced_secondary)} {self.secondary_event_name} records"
@@ -283,6 +347,22 @@ class ScanProcessor:
             self.logger.info(
                 f"{self.secondary_event_name} registration-seminar badge intersection: {len(secondary_badges_intersection)} out of {len(secondary_reg_badges)} registration badges and {len(secondary_seminar_badges)} seminar badges"
             )
+
+            if self.mode == "post_analysis" and not self.seminars_scans_this_year_enhanced.empty:
+                this_seminar_keys = set(self.seminars_scans_this_year_enhanced["key_text"].unique())
+                this_session_keys = set(self.session_this["key_text"].unique())
+                current_keys_intersection = this_seminar_keys.intersection(this_session_keys)
+                self.logger.info(
+                    f"This-year seminar-session intersection (post analysis): {len(current_keys_intersection)} out of {len(this_seminar_keys)} seminar keys and {len(this_session_keys)} session keys"
+                )
+
+                if not self.reg_data_this_year.empty:
+                    this_reg_badges = set(self.reg_data_this_year["BadgeId"].unique())
+                    this_seminar_badges = set(self.seminars_scans_this_year_enhanced["Badge Id"].unique())
+                    this_badges_intersection = this_reg_badges.intersection(this_seminar_badges)
+                    self.logger.info(
+                        f"This-year registration-seminar badge intersection: {len(this_badges_intersection)} out of {len(this_reg_badges)} registration badges and {len(this_seminar_badges)} seminar badges"
+                    )
 
         except Exception as e:
             self.logger.error(f"Error analyzing data intersections: {e}", exc_info=True)
@@ -416,6 +496,47 @@ class ScanProcessor:
             self.enhanced_seminars_df_main.to_csv(main_sessions_output_path, index=False)
             self.enhanced_seminars_df_secondary.to_csv(secondary_sessions_output_path, index=False)
 
+            if self.mode == "post_analysis" and not self.seminars_scans_this_year_enhanced.empty:
+                this_year_scan_output_path = os.path.join(
+                    self.output_dir,
+                    "output",
+                    scan_data_config.get("this_year_post", "scan_this_post.csv")
+                )
+                this_year_sessions_output_path = os.path.join(
+                    self.output_dir,
+                    "output",
+                    sessions_visited_config.get("this_year_post", "sessions_visited_this_year.csv")
+                )
+
+                this_year_enhanced = self.add_demographics_to_seminars(
+                    self.df_reg_wdemo_this_year,
+                    self.seminars_scans_this_year_enhanced
+                ) if not self.df_reg_wdemo_this_year.empty else self.seminars_scans_this_year_enhanced.copy()
+
+                # Ensure key_text column exists for downstream matching
+                if "key_text" not in this_year_enhanced.columns and "Seminar Name" in this_year_enhanced.columns:
+                    this_year_enhanced["key_text"] = this_year_enhanced["Seminar Name"].apply(self.clean_text)
+
+                self.seminars_scans_this_year_enhanced.to_csv(this_year_scan_output_path, index=False)
+                this_year_enhanced.to_csv(this_year_sessions_output_path, index=False)
+                self.enhanced_seminars_df_this_year = this_year_enhanced
+
+                # Consistency check with personal agenda outputs
+                expected_columns = set(self.enhanced_seminars_df_main.columns)
+                current_columns = set(this_year_enhanced.columns)
+                if expected_columns != current_columns:
+                    self.logger.warning(
+                        "Post-analysis sessions output columns differ from personal_agendas baseline. Missing: %s | Additional: %s",
+                        expected_columns - current_columns,
+                        current_columns - expected_columns,
+                    )
+                else:
+                    self.logger.info("Post-analysis sessions output matches personal_agendas column schema")
+
+                self.logger.info(
+                    f"Saved post-analysis scan data: {len(self.seminars_scans_this_year_enhanced)} this-year records, with demographics records={len(this_year_enhanced)}"
+                )
+
             self.logger.info(f"Saved processed scan data to {self.output_dir}/output/")
             self.logger.info(
                 f"{self.main_event_name} scan data: {len(self.seminars_scans_past_enhanced_main)} records"
@@ -429,6 +550,11 @@ class ScanProcessor:
             self.logger.info(
                 f"{self.secondary_event_name} sessions with demographics: {len(self.enhanced_seminars_df_secondary)} records"
             )
+
+            if self.mode == "post_analysis" and not self.seminars_scans_this_year_enhanced.empty:
+                self.logger.info(
+                    f"Post-analysis sessions with demographics (this year): {len(this_year_enhanced)} records"
+                )
 
         except Exception as e:
             self.logger.error(f"Error saving processed data: {e}", exc_info=True)
