@@ -13,7 +13,7 @@ import logging
 import traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Optional, Union, Tuple
 
 import pandas as pd
 import mlflow
@@ -271,7 +271,7 @@ class DataPreparationStep:
     def download_blob_data(self, uri_or_path: str, local_dir: str) -> List[str]:
         """
         Download data from Azure Blob Storage or copy from mounted path.
-        Maps files to expected PA pipeline structure.
+        Maps files to expected PA pipeline structure using config-defined inputs.
         
         Args:
             uri_or_path: Azure blob URI or mounted local path
@@ -281,177 +281,319 @@ class DataPreparationStep:
             List of downloaded/copied file paths
         """
         self.logger.info(f"Processing input data from: {uri_or_path}")
-        downloaded_files = []
+        downloaded_files: List[str] = []
         
-        # Get event name from config to determine target folder
         event_name = self.config.get('event', {}).get('name', 'ecomm')
         event_folder = os.path.join(local_dir, event_name)
         os.makedirs(event_folder, exist_ok=True)
         
-        # Define file mappings based on the configuration
-        # Maps source filename patterns to expected locations
-        file_mappings = self._get_file_mappings(event_name)
+        file_index, path_lookup = self._build_config_file_index()
+        expected_total = sum(len(entries) for entries in file_index.values())
+        if expected_total:
+            self.logger.info(
+                f"Tracking {expected_total} config-defined input files before copying payload"
+            )
+        else:
+            self.logger.warning(
+                "No config-driven input files detected; all files will be placed directly under the event folder"
+            )
         
         try:
-            # Check if it's a local path (mounted by Azure ML) or a URI
             if os.path.exists(uri_or_path) and os.path.isdir(uri_or_path):
-                # It's a mounted path - copy files with proper mapping
                 self.logger.info(f"Input is a mounted directory: {uri_or_path}")
-                
-                # List all files in the mounted directory
-                for root, dirs, files in os.walk(uri_or_path):
-                    for file in files:
-                        source_path = os.path.join(root, file)
-                        
-                        # Map the file to its expected destination
-                        dest_path = self._map_file_path(
-                            file, source_path, event_folder, file_mappings
+                for root, _, files in os.walk(uri_or_path):
+                    for filename in files:
+                        source_path = os.path.join(root, filename)
+                        dest_path, matched_entry = self._resolve_destination_path(
+                            filename, event_folder, file_index
                         )
-                        
+
                         if dest_path:
-                            # Create destination directory if needed
                             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                            
-                            # Copy file
                             shutil.copy2(source_path, dest_path)
                             downloaded_files.append(dest_path)
-                            self.logger.info(f"Copied: {source_path} -> {dest_path}")
+                            self._mark_file_as_found(dest_path, path_lookup)
+
+                            if matched_entry:
+                                self.logger.info(
+                                    f"Copied config file: {source_path} -> {matched_entry['relative_path']}"
+                                )
+                            else:
+                                self.logger.info(
+                                    f"Copied unmapped file: {source_path} -> {dest_path}"
+                                )
                         else:
-                            self.logger.warning(f"No mapping found for file: {file}")
-                        
+                            self.logger.warning(f"No mapping found for file: {filename}")
+
             elif uri_or_path.startswith('azureml://'):
-                # It's an Azure ML URI - use AzureMachineLearningFileSystem
                 self.logger.info(f"Input is an Azure ML URI: {uri_or_path}")
-                
                 fs = AzureMachineLearningFileSystem(uri_or_path)
-                
-                # List all files to download
-                file_paths = fs.ls()
-                
-                for file_path in file_paths:
-                    file_name = os.path.basename(file_path)
-                    
-                    # Map the file to its expected destination
-                    dest_path = self._map_file_path(
-                        file_name, file_path, event_folder, file_mappings
+                for file_path in fs.ls():
+                    filename = os.path.basename(file_path)
+                    dest_path, matched_entry = self._resolve_destination_path(
+                        filename, event_folder, file_index
                     )
-                    
+
                     if dest_path:
-                        # Create destination directory if needed
                         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                        
-                        # Download file
-                        with fs.open(file_path, 'rb') as src:
-                            with open(dest_path, 'wb') as dst:
-                                dst.write(src.read())
-                        
+                        with fs.open(file_path, 'rb') as src, open(dest_path, 'wb') as dst:
+                            dst.write(src.read())
                         downloaded_files.append(dest_path)
-                        self.logger.info(f"Downloaded: {file_path} -> {dest_path}")
+                        self._mark_file_as_found(dest_path, path_lookup)
+
+                        if matched_entry:
+                            self.logger.info(
+                                f"Downloaded config file: {file_path} -> {matched_entry['relative_path']}"
+                            )
+                        else:
+                            self.logger.info(
+                                f"Downloaded unmapped file: {file_path} -> {dest_path}"
+                            )
                     else:
-                        self.logger.warning(f"No mapping found for file: {file_name}")
+                        self.logger.warning(f"No mapping found for file: {filename}")
             else:
-                # Unknown format
                 raise ValueError(f"Input path format not recognized: {uri_or_path}")
-                
         except Exception as e:
             self.logger.error(f"Error processing input data: {str(e)}")
             raise
-        
+
+        self._report_missing_config_files(file_index)
         self.logger.info(f"Successfully processed {len(downloaded_files)} files")
         return downloaded_files
-    
-    def _get_file_mappings(self, event_name: str) -> Dict[str, str]:
-        """
-        Get file mappings based on event type.
-        Maps source filenames (or patterns) to expected paths in data/ folder.
-        
-        Args:
-            event_name: Name of the event (ecomm, vet, etc.)
-            
-        Returns:
-            Dictionary of filename patterns to target paths
-        """
-        # These mappings should align with what's expected in config yaml files
-        if event_name == 'ecomm':
-            return {
-                # Registration files
-                '20250818_registration_ECE_TFM_24_25.json': 'data/ecomm/20250818_registration_ECE_TFM_24_25.json',
-                '20250722_registration_TFM24.json': 'data/ecomm/20250722_registration_TFM24.json',
-                # Demographic files
-                '20250818_demographics_ECE_TFM_24_25.json': 'data/ecomm/20250818_demographics_ECE_TFM_24_25.json',
-                '20250722_demographics_TFM24.json': 'data/ecomm/20250722_demographics_TFM24.json',
-                # Session files
-                'ECE_TFM_25_session_export.csv': 'data/ecomm/ECE_TFM_25_session_export.csv',
-                'ECE25_session_export.csv': 'data/ecomm/ECE25_session_export.csv',
-                'ECE24_session_export.csv': 'data/ecomm/ECE24_session_export.csv',
-                'TFM24_session_export.csv': 'data/ecomm/TFM24_session_export.csv',
-                # Scan files
-                'ece2024 seminar scans reference.csv': 'data/ecomm/ece2024 seminar scans reference.csv',
-                'ece2024 seminar scans.csv': 'data/ecomm/ece2024 seminar scans.csv',
-                'tfm2024 seminar scans reference.csv': 'data/ecomm/tfm2024 seminar scans reference.csv',
-                'tfm2024 seminar scans.csv': 'data/ecomm/tfm2024 seminar scans.csv',
-            }
-        elif event_name == 'vet':
-            return {
-                # Registration files
-                '20250818_registration_BVA_LVA_24_25.json': 'data/vet/20250818_registration_BVA_LVA_24_25.json',
-                '20250722_registration_LVS24.json': 'data/vet/20250722_registration_LVS24.json',
-                # Demographic files
-                '20250818_demographics_BVA_LVA_24_25.json': 'data/vet/20250818_demographics_BVA_LVA_24_25.json',
-                '20250722_demographics_LVS24.json': 'data/vet/20250722_demographics_LVS24.json',
-                # Session files
-                'BVA25_session_export.csv': 'data/vet/BVA25_session_export.csv',
-                'BVA24_session_export.csv': 'data/vet/BVA24_session_export.csv',
-                'LVS24_session_export.csv': 'data/vet/LVS24_session_export.csv',
-                # Scan files
-                'bva2024 seminar scans reference.csv': 'data/vet/bva2024 seminar scans reference.csv',
-                'bva2024 seminar scans.csv': 'data/vet/bva2024 seminar scans.csv',
-                'lva2024 seminar scans reference.csv': 'data/vet/lva2024 seminar scans reference.csv',
-                'lva2024 seminar scans.csv': 'data/vet/lva2024 seminar scans.csv',
-            }
-        else:
-            # For other events, just copy to event folder maintaining structure
-            return {}
-    
-    def _map_file_path(
-        self, 
-        filename: str, 
-        source_path: str, 
-        event_folder: str, 
-        file_mappings: Dict[str, str]
-    ) -> Optional[str]:
-        """
-        Map a source file to its expected destination path.
-        
-        Args:
-            filename: Name of the file
-            source_path: Full source path
-            event_folder: Target event folder (data/ecomm or data/vet)
-            file_mappings: Dictionary of filename mappings
-            
-        Returns:
-            Destination path or None if no mapping found
-        """
-        # First check exact filename match
-        if filename in file_mappings:
-            # Return the mapped path relative to project root
-            return os.path.join(
-                os.path.dirname(os.path.dirname(event_folder)),  # Go up to project root
-                file_mappings[filename]
-            )
-        
-        # Check if filename contains any mapping key (partial match)
-        for pattern, target_path in file_mappings.items():
-            if pattern in filename or filename in pattern:
-                return os.path.join(
-                    os.path.dirname(os.path.dirname(event_folder)),  # Go up to project root
-                    target_path
+
+    def _extract_file_paths(self, value: Any) -> List[str]:
+        """Recursively collect string paths from nested config structures."""
+        paths: List[str] = []
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned:
+                paths.append(cleaned)
+        elif isinstance(value, dict):
+            for nested_value in value.values():
+                paths.extend(self._extract_file_paths(nested_value))
+        elif isinstance(value, list):
+            for item in value:
+                paths.extend(self._extract_file_paths(item))
+        return paths
+
+    def _normalize_config_path(self, path_value: str) -> str:
+        """Normalize relative config paths to use forward slashes and no leading ./"""
+        normalized = path_value.strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized.lstrip("/")
+
+    def _build_config_file_index(self) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, List[Dict[str, Any]]]]:
+        """Create lookup tables for config-defined input files."""
+        sections: Dict[str, Any] = {
+            'input_files': self.config.get('input_files', {}),
+            'scan_files': self.config.get('scan_files', {}),
+            'session_files': self.config.get('session_files', {})
+        }
+
+        post_analysis_config = self.config.get('post_analysis_mode') or {}
+        for pa_section in ('scan_files', 'entry_scan_files'):
+            if pa_section in post_analysis_config:
+                sections[f'post_analysis_mode.{pa_section}'] = post_analysis_config.get(pa_section)
+
+        name_index: Dict[str, List[Dict[str, Any]]] = {}
+        path_lookup: Dict[str, List[Dict[str, Any]]] = {}
+
+        for section_name, section_value in sections.items():
+            if not section_value:
+                continue
+
+            for raw_path in self._extract_file_paths(section_value):
+                cleaned = raw_path.strip()
+                if not cleaned:
+                    continue
+
+                if os.path.isabs(cleaned):
+                    destination_path = os.path.normpath(cleaned)
+                    display_path = cleaned
+                else:
+                    normalized_rel = self._normalize_config_path(cleaned)
+                    destination_path = os.path.normpath(os.path.join(root_dir, normalized_rel))
+                    display_path = normalized_rel
+
+                filename = os.path.basename(destination_path).lower()
+                if not filename:
+                    continue
+
+                entry = {
+                    'relative_path': display_path,
+                    'absolute_path': destination_path,
+                    'section': section_name,
+                    'found': False
+                }
+
+                name_index.setdefault(filename, []).append(entry)
+                normalized_abs = os.path.normcase(destination_path)
+                path_lookup.setdefault(normalized_abs, []).append(entry)
+
+        return name_index, path_lookup
+
+    def _match_config_entry(self, filename: str, file_index: Dict[str, List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+        """Find the config entry that matches the provided filename."""
+        key = filename.lower()
+        if key in file_index:
+            for entry in file_index[key]:
+                if not entry['found']:
+                    return entry
+            return file_index[key][0]
+
+        for candidate, entries in file_index.items():
+            if candidate in key or key in candidate:
+                for entry in entries:
+                    if not entry['found']:
+                        return entry
+                return entries[0]
+
+        return None
+
+    def _resolve_destination_path(
+        self,
+        filename: str,
+        event_folder: str,
+        file_index: Dict[str, List[Dict[str, Any]]]
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Determine where an input file should be stored for processing."""
+        entry = self._match_config_entry(filename, file_index)
+        if entry:
+            return entry['absolute_path'], entry
+
+        fallback_path = os.path.join(event_folder, filename)
+        return fallback_path, None
+
+    def _mark_file_as_found(
+        self,
+        destination_path: str,
+        path_lookup: Dict[str, List[Dict[str, Any]]]
+    ) -> None:
+        """Mark config entries as satisfied for the provided destination."""
+        normalized = os.path.normcase(os.path.abspath(destination_path))
+        if normalized in path_lookup:
+            for entry in path_lookup[normalized]:
+                entry['found'] = True
+
+    def _report_missing_config_files(self, file_index: Dict[str, List[Dict[str, Any]]]) -> None:
+        """Log any config-declared inputs that were not found in the payload."""
+        if not file_index:
+            return
+
+        missing: List[Dict[str, Any]] = []
+        for entries in file_index.values():
+            for entry in entries:
+                if not entry['found']:
+                    missing.append(entry)
+
+        if missing:
+            self.logger.warning("Config declared input files missing from payload:")
+            for entry in missing:
+                self.logger.warning(
+                    f"  • {entry['relative_path']} (section: {entry['section']})"
                 )
-        
-        # If no specific mapping, place in event folder maintaining any subdirectory structure
-        # This handles any additional files not explicitly mapped
-        rel_path = os.path.relpath(source_path, os.path.dirname(source_path))
-        return os.path.join(event_folder, rel_path)
+        else:
+            self.logger.info("All config-declared input files were located in the payload.")
+
+    def _resolve_output_directory(self) -> str:
+        """Return the absolute output directory as defined in config or defaults."""
+        configured = self.config.get('output_dir')
+        if configured:
+            normalized = configured if os.path.isabs(configured) else os.path.join(
+                root_dir, self._normalize_config_path(configured)
+            )
+            return os.path.normpath(normalized)
+
+        event_name = self.config.get('event', {}).get('name', 'ecomm')
+        return os.path.join(root_dir, 'data', event_name)
+
+    def _append_output_file(
+        self,
+        collection: List[Tuple[str, str]],
+        base_dir: str,
+        filename: Optional[str],
+        dest_name: Optional[str] = None
+    ) -> None:
+        """Helper to add config-declared output files to copy list."""
+        if not filename:
+            return
+
+        cleaned = str(filename).strip()
+        if not cleaned:
+            return
+
+        source_path = cleaned if os.path.isabs(cleaned) else os.path.join(base_dir, cleaned)
+        normalized_source = os.path.normpath(source_path)
+        destination = (dest_name or os.path.basename(cleaned) or cleaned).strip()
+        if not destination:
+            destination = os.path.basename(normalized_source)
+
+        collection.append((normalized_source, destination))
+
+    def _build_output_file_mappings(self) -> Dict[str, List[Tuple[str, str]]]:
+        """Construct Azure output mappings based on config-defined artifacts."""
+        mappings: Dict[str, List[Tuple[str, str]]] = {
+            'output_registration': [],
+            'output_scan': [],
+            'output_session': []
+        }
+
+        output_root = self._resolve_output_directory()
+        standard_output_dir = os.path.join(output_root, 'output')
+
+        output_files = self.config.get('output_files', {})
+
+        combined_registration = output_files.get('combined_demographic_registration', {})
+        for key in ('this_year', 'last_year_main', 'last_year_secondary'):
+            self._append_output_file(
+                mappings['output_registration'], standard_output_dir, combined_registration.get(key)
+            )
+
+        registration_with_demo = output_files.get('registration_with_demographic', {})
+        for key in ('this_year', 'last_year_main', 'last_year_secondary'):
+            self._append_output_file(
+                mappings['output_registration'], standard_output_dir, registration_with_demo.get(key)
+            )
+
+        processed_demographics = output_files.get('processed_demographic_data', {})
+        for key in ('this_year', 'last_year_main', 'last_year_secondary'):
+            self._append_output_file(
+                mappings['output_registration'], standard_output_dir, processed_demographics.get(key)
+            )
+
+        scan_outputs = self.config.get('scan_output_files', {})
+        processed_scans = scan_outputs.get('processed_scans', {})
+        for key in ('this_year', 'last_year_main', 'last_year_secondary', 'this_year_post'):
+            self._append_output_file(
+                mappings['output_scan'], standard_output_dir, processed_scans.get(key)
+            )
+
+        sessions_visited = scan_outputs.get('sessions_visited', {})
+        for value in sessions_visited.values():
+            self._append_output_file(mappings['output_scan'], standard_output_dir, value)
+
+        attended_inputs = scan_outputs.get('attended_session_inputs', {})
+        for value in attended_inputs.values():
+            self._append_output_file(mappings['output_scan'], standard_output_dir, value)
+
+        session_outputs = self.config.get('session_output_files', {})
+        processed_sessions = session_outputs.get('processed_sessions', {})
+        for key in ('this_year', 'last_year_main', 'last_year_secondary'):
+            self._append_output_file(
+                mappings['output_session'], standard_output_dir, processed_sessions.get(key)
+            )
+
+        streams_catalog = session_outputs.get('streams_catalog')
+        self._append_output_file(mappings['output_session'], standard_output_dir, streams_catalog,
+                                 dest_name=os.path.basename(streams_catalog) if streams_catalog else None)
+
+        # Legacy fallback files that may not be explicitly declared in config
+        self._append_output_file(mappings['output_session'], standard_output_dir, 'streams.csv', dest_name='streams.csv')
+        self._append_output_file(mappings['output_session'], standard_output_dir, 'streams_cache.json', dest_name='streams_cache.json')
+
+        # Remove empty mappings to avoid unnecessary copy attempts
+        return {key: value for key, value in mappings.items() if value}
     
     def setup_data_directories(self, root_dir: str) -> Dict[str, str]:
         """
@@ -469,7 +611,7 @@ class DataPreparationStep:
             'temp': os.path.join(root_dir, 'temp'),
             'artifacts': os.path.join(root_dir, 'artifacts')
         }
-        
+
         for dir_name, dir_path in directories.items():
             os.makedirs(dir_path, exist_ok=True)
             self.logger.info(f"Created directory: {dir_path}")
@@ -485,27 +627,21 @@ class DataPreparationStep:
         """
         self.logger.info("Starting Registration Processing")
         
-        # Store the original working directory
         original_cwd = os.getcwd()
         self.logger.info(f"Current working directory: {original_cwd}")
         
-        # Change to the azureml_pipeline directory where data files are located
         os.chdir(root_dir)
         self.logger.info(f"Changed working directory to: {root_dir}")
         
         try:
             processor = RegistrationProcessor(self.config)
             
-            # Check if we should skip this processor
             if self.config.get('processors', {}).get('registration_processing', {}).get('enabled', True):
-                # Call process without arguments - PA processors don't accept incremental parameter
                 processor.process()
                 
-                # Collect output information
                 output_dir = self.config.get('output_dir', 'output')
-                output_files = []
+                output_files: List[str] = []
                 
-                # Check for expected output files
                 expected_files = [
                     'df_reg_demo_this.csv',
                     'df_reg_demo_last_bva.csv', 
@@ -527,7 +663,7 @@ class DataPreparationStep:
                     'output_dir': output_dir
                 }
                 
-                self.logger.info(f"Registration processing completed successfully")
+                self.logger.info("Registration processing completed successfully")
                 return result
             else:
                 self.logger.info("Registration processing is disabled in config")
@@ -537,7 +673,6 @@ class DataPreparationStep:
             self.logger.error(f"Registration processing failed: {str(e)}")
             raise
         finally:
-            # Always restore the original working directory
             os.chdir(original_cwd)
             self.logger.info(f"Restored working directory to: {original_cwd}")
     
@@ -550,27 +685,21 @@ class DataPreparationStep:
         """
         self.logger.info("Starting Scan Processing")
         
-        # Store the original working directory
         original_cwd = os.getcwd()
         self.logger.info(f"Current working directory: {original_cwd}")
         
-        # Change to the azureml_pipeline directory where data files are located
         os.chdir(root_dir)
         self.logger.info(f"Changed working directory to: {root_dir}")
         
         try:
             processor = ScanProcessor(self.config)
             
-            # Check if we should skip this processor
             if self.config.get('processors', {}).get('scan_processing', {}).get('enabled', True):
-                # Call process without arguments - PA processors don't accept incremental parameter
                 processor.process()
                 
-                # Collect output information
                 output_dir = self.config.get('output_dir', 'output')
-                output_files = []
+                output_files: List[str] = []
                 
-                # Check for expected output files
                 expected_files = [
                     'sessions_visited_last_bva.csv',
                     'sessions_visited_last_lva.csv',
@@ -590,7 +719,7 @@ class DataPreparationStep:
                     'output_dir': output_dir
                 }
                 
-                self.logger.info(f"Scan processing completed successfully")
+                self.logger.info("Scan processing completed successfully")
                 return result
             else:
                 self.logger.info("Scan processing is disabled in config")
@@ -600,7 +729,6 @@ class DataPreparationStep:
             self.logger.error(f"Scan processing failed: {str(e)}")
             raise
         finally:
-            # Always restore the original working directory
             os.chdir(original_cwd)
             self.logger.info(f"Restored working directory to: {original_cwd}")
     
@@ -722,38 +850,8 @@ class DataPreparationStep:
         self.logger.info("Saving outputs to Azure ML paths")
         self.logger.info(f"Output paths provided: {output_paths}")
         
-        event_name = self.config.get('event', {}).get('name', 'ecomm')
-        
-        # Map processor outputs to the files Step 2 expects
-        # The key is the output mount, the value is list of (source_file, dest_name) tuples
-        file_mappings = {
-            'output_registration': [
-                # These files are created by registration_processor in data/{event}/output/
-                (f'data/{event_name}/output/df_reg_demo_this.csv', 'df_reg_demo_this.csv'),
-                (f'data/{event_name}/output/df_reg_demo_last_bva.csv', 'df_reg_demo_last_bva.csv'),
-                (f'data/{event_name}/output/df_reg_demo_last_lva.csv', 'df_reg_demo_last_lva.csv'),
-
-            ],
-            'output_scan': [
-                # Scan processor creates these files
-                # For ecomm event:
-                (f'data/{event_name}/output/sessions_visited_last_bva.csv', 'sessions_visited_last_bva.csv'),
-                (f'data/{event_name}/output/sessions_visited_last_lva.csv', 'sessions_visited_last_lva.csv'),
-                (f'data/{event_name}/output/scan_lva_past.csv', 'scan_lva_past.csv'),
-                (f'data/{event_name}/output/scan_bva_past.csv', 'scan_bva_past.csv'),
-
-            ],
-            'output_session': [
-                # Session processor outputs
-                (f'data/{event_name}/output/session_this_filtered_valid_cols.csv', 'session_this_filtered_valid_cols.csv'),
-                (f'data/{event_name}/output/session_last_filtered_valid_cols_bva.csv', 'session_last_filtered_valid_cols_bva.csv'),
-                (f'data/{event_name}/output/session_last_filtered_valid_cols_lva.csv', 'session_last_filtered_valid_cols_lva.csv'),
-                (f'data/{event_name}/output/streams.json', 'streams.json'),
-                (f'data/{event_name}/output/streams.csv', 'streams.csv'),
-                # Cache file if exists
-                (f'data/{event_name}/output/streams_cache.json', 'streams_cache.json'),
-            ]
-        }
+        file_mappings = self._build_output_file_mappings()
+        output_root = self._resolve_output_directory()
         
         # Process each output type
         total_files_copied = 0
@@ -774,15 +872,11 @@ class DataPreparationStep:
                 files_copied_for_output = 0
                 
                 for source_file, dest_name in file_list:
-                    # Build full source path
-                    full_source = os.path.join(root_dir, source_file)
-                    
-                    # Try multiple possible locations
                     possible_sources = [
-                        full_source,  # Primary expected location
-                        os.path.join(root_dir, 'data', 'output', dest_name),  # Fallback to data/output
-                        os.path.join(root_dir, 'data', 'output', os.path.basename(source_file)),  # Original filename in output
-                        os.path.join(root_dir, 'azureml_pipeline', source_file),  # In case of relative path issues
+                        source_file,
+                        os.path.join(output_root, dest_name),
+                        os.path.join(output_root, os.path.basename(dest_name)),
+                        os.path.join(root_dir, 'data', 'output', dest_name),
                     ]
                     
                     file_copied = False

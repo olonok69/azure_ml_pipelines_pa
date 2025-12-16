@@ -155,6 +155,11 @@ scan_output_files:
     this_year: "scan_this_filtered_valid_cols.csv"
     last_year_main: "scan_last_filtered_valid_cols_bva.csv"
     last_year_secondary: "scan_last_filtered_valid_cols_lva.csv"
+    this_year_post: "scan_this_year_post.csv"
+  sessions_visited:
+    main_event: "sessions_visited_last_bva.csv"
+    secondary_event: "sessions_visited_last_lva.csv"
+    this_year_post: "sessions_visited_this_year.csv"
   # Added explicit filenames used by attended_session relationship creation logic (currently hard-coded in processor)
   attended_session_inputs:
     past_year_main_scan: "scan_bva_past.csv"            # Raw past-year main scan file actually consumed when building attended_session
