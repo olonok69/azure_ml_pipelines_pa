@@ -16,7 +16,8 @@ import logging
 import traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
+from urllib.parse import urlparse
 import time
 
 import pandas as pd
@@ -50,6 +51,7 @@ from PA.session_recommendation_processor import SessionRecommendationProcessor
 from PA.utils.config_utils import load_config
 from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
+from PA.utils.app_insights import configure_app_insights
 from neo4j_env_utils import apply_neo4j_credentials
 import mlflow
 from neo4j import GraphDatabase
@@ -83,6 +85,7 @@ class RecommendationsStep:
         config_path: str,
         incremental: bool = False,
         session_data_path: Optional[str] = None,
+        input_data_uri: Optional[str] = None,
         use_keyvault: bool = True,
     ):
         """
@@ -98,6 +101,7 @@ class RecommendationsStep:
         self.incremental = incremental
         self.use_keyvault = use_keyvault
         self.session_data_path = Path(session_data_path) if session_data_path else None
+        self.input_data_uri = input_data_uri
         self.logger = self._setup_logging()
 
         # Load config early
@@ -227,6 +231,36 @@ class RecommendationsStep:
         )
         return logging.getLogger(__name__)
 
+    def _parse_input_data_uri(self) -> Optional[Tuple[str, str]]:
+        """Return datastore name and base path extracted from the pipeline input URI."""
+        if not self.input_data_uri:
+            return None
+
+        try:
+            parsed = urlparse(self.input_data_uri)
+        except Exception as exc:
+            self.logger.warning("Unable to parse input data URI '%s': %s", self.input_data_uri, exc)
+            return None
+
+        segments = [segment for segment in parsed.path.strip('/').split('/') if segment]
+        datastore_name = None
+        path_prefix = ''
+
+        for idx, segment in enumerate(segments):
+            if segment.lower() == 'datastores' and idx + 1 < len(segments):
+                datastore_name = segments[idx + 1]
+            if segment.lower() == 'paths' and idx + 1 < len(segments):
+                path_prefix = '/'.join(segments[idx + 1:])
+                break
+
+        if not datastore_name:
+            self.logger.warning(
+                "Unable to locate datastore name in input URI '%s'", self.input_data_uri
+            )
+            return None
+
+        return datastore_name, path_prefix
+
     def _remap_session_support_files(self) -> None:
         """Point config-declared session files to the mounted Step 1 outputs."""
         if not self.session_data_path:
@@ -284,6 +318,55 @@ class RecommendationsStep:
                     theatre_cfg.get(field),
                     f"recommendation.theatre_capacity_limits.{field}"
                 )
+
+    def upload_pipeline_artifacts(self) -> None:
+        """Upload the full set of pipeline artifacts to the landing datastore."""
+        target_info = self._parse_input_data_uri()
+        if not target_info:
+            self.logger.warning("Skipping artifact upload; pipeline input URI not available")
+            return
+
+        datastore_name, base_path = target_info
+        subscription_id = os.getenv("SUBSCRIPTION_ID")
+        resource_group = os.getenv("RESOURCE_GROUP")
+        workspace_name = os.getenv("AZUREML_WORKSPACE_NAME")
+
+        if not all([subscription_id, resource_group, workspace_name]):
+            self.logger.warning(
+                "Missing Azure ML workspace environment variables; cannot upload artifacts"
+            )
+            return
+
+        event_name = self.config.get('event', {}).get('name', 'ecomm')
+        artifacts_root = Path(root_dir) / 'data' / event_name
+        if not artifacts_root.exists():
+            self.logger.warning("Artifacts directory %s not found; nothing to upload", artifacts_root)
+            return
+
+        target_prefix = base_path.rstrip('/') if base_path else ''
+        if target_prefix:
+            target_path = f"{target_prefix}/azureml_pipeline/data/{event_name}/output_artifacts"
+        else:
+            target_path = f"azureml_pipeline/data/{event_name}/output_artifacts"
+
+        try:
+            credential = self._get_azure_credential()
+            ml_client = MLClient(credential, subscription_id, resource_group, workspace_name)
+            self.logger.info(
+                "Uploading pipeline artifacts from %s to datastore '%s' at '%s'",
+                artifacts_root,
+                datastore_name,
+                target_path,
+            )
+            ml_client.datastores.upload(
+                name=datastore_name,
+                path=str(artifacts_root),
+                target_path=target_path,
+                overwrite=True,
+            )
+            self.logger.info("Pipeline artifacts uploaded successfully")
+        except Exception as exc:  # pragma: no cover - network side effects
+            self.logger.error("Failed to upload pipeline artifacts: %s", exc, exc_info=True)
     
     def _get_azure_credential(self):
         """
@@ -721,12 +804,14 @@ def main(args):
     
     # Load environment variables
     load_dotenv()
+    configure_app_insights(service_name="pa_step4_recommendations")
     
     # Initialize step
     step = RecommendationsStep(
         args.config,
         args.incremental,
         session_data_path=args.session_data,
+        input_data_uri=args.input_data_uri,
     )
     
     # Run processing
@@ -739,6 +824,7 @@ def main(args):
         results = {'recommendations': {'status': 'failed', 'error': str(e), 'statistics': {}}}
 
     step.save_outputs(results, args.output_metadata)
+    step.upload_pipeline_artifacts()
 
     # Remove duplicate MLflow setup (configure_mlflow already called)
     if mlflow.active_run():
@@ -829,6 +915,12 @@ def parse_args():
         "--session_data",
         type=str,
         help="Path to mounted session data artifacts from Step 1"
+    )
+
+    parser.add_argument(
+        "--input_data_uri",
+        type=str,
+        help="Azure ML URI of the landing datastore used for pipeline inputs"
     )
     
     return parser.parse_args()

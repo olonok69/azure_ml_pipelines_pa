@@ -1,4 +1,6 @@
 import logging
+from dotenv import load_dotenv
+from utils.app_insights import configure_app_insights
 from registration_processor import RegistrationProcessor
 from scan_processor import ScanProcessor
 from session_processor import SessionProcessor
@@ -9,6 +11,9 @@ from neo4j_specialization_stream_processor import Neo4jSpecializationStreamProce
 from neo4j_visitor_relationship_processor import Neo4jVisitorRelationshipProcessor
 from session_embedding_processor import SessionEmbeddingProcessor
 from session_recommendation_processor import SessionRecommendationProcessor
+
+load_dotenv()
+configure_app_insights(service_name="pa_local_pipeline")
 
 
 # Replace the run_registration_processing function in pipeline.py:

@@ -45,6 +45,7 @@ from PA.neo4j_visitor_relationship_processor import Neo4jVisitorRelationshipProc
 from PA.utils.config_utils import load_config
 from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
+from PA.utils.app_insights import configure_app_insights
 from neo4j_env_utils import apply_neo4j_credentials
 
 
@@ -628,6 +629,7 @@ def main(args):
     
     # Load environment variables
     load_dotenv()
+    configure_app_insights(service_name="pa_step2_neo4j_prep")
     
     try:
         # Initialize the step

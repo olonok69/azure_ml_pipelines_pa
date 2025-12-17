@@ -44,6 +44,7 @@ from PA.session_processor import SessionProcessor
 from PA.utils.config_utils import load_config
 from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
+from PA.utils.app_insights import configure_app_insights
 
 
 
@@ -1194,6 +1195,7 @@ def main(args):
     
     # Load environment variables
     load_dotenv()
+    configure_app_insights(service_name="pa_step1_data_prep")
     
     try:
         # Initialize credentials and ML client if needed
