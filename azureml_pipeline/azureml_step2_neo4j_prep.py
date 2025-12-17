@@ -204,6 +204,38 @@ class Neo4jPreparationStep:
             self.logger.info(f"Created/verified directory: {name} -> {path}")
         
         return directories
+
+    def _normalize_config_path(self, path_value: str) -> str:
+        text = (path_value or '').replace('\\', '/').strip()
+        while text.startswith('./'):
+            text = text[2:]
+        return text.lstrip('/')
+
+    def _relative_support_path(self, path_value: str, event_name: str) -> str:
+        normalized = self._normalize_config_path(path_value)
+        event_prefix = f"data/{event_name}/"
+        if normalized.lower().startswith(event_prefix.lower()):
+            return normalized[len(event_prefix):]
+        return os.path.basename(normalized)
+
+    def _get_neo4j_support_targets(self, event_name: str) -> Dict[str, str]:
+        targets: Dict[str, str] = {}
+        neo4j_cfg = self.config.get('neo4j', {}) or {}
+
+        mapping_specs = [
+            (neo4j_cfg.get('job_stream_mapping', {}) or {}).get('file'),
+            (neo4j_cfg.get('specialization_stream_mapping', {}) or {}).get('file'),
+        ]
+
+        for path_value in mapping_specs:
+            if not path_value:
+                continue
+            relative_path = self._relative_support_path(path_value, event_name)
+            if not relative_path:
+                continue
+            targets.setdefault(os.path.basename(relative_path).lower(), relative_path)
+
+        return targets
     
     def copy_input_data(self, input_paths: Dict[str, str], data_dir: str) -> bool:
         """
@@ -223,16 +255,20 @@ class Neo4jPreparationStep:
             
             # Create the expected directory structure
             # Neo4j processors look in data/ecomm/output/
-            output_dir = os.path.join(data_dir, event_name, 'output')
+            event_root_dir = os.path.join(data_dir, event_name)
+            output_dir = os.path.join(event_root_dir, 'output')
             os.makedirs(output_dir, exist_ok=True)
             self.logger.info(f"Created output directory: {output_dir}")
             
             # Also create the data/output directory as Step 1 may have created files there
             alt_output_dir = os.path.join(data_dir, 'output')
             os.makedirs(alt_output_dir, exist_ok=True)
+            os.makedirs(event_root_dir, exist_ok=True)
             
             # Track all copied files
             copied_files = []
+            support_targets = self._get_neo4j_support_targets(event_name)
+            support_status = {key: False for key in support_targets.keys()}
             
             # Debug: List what's in each input path
             for input_key in ['input_registration', 'input_scan', 'input_session']:
@@ -291,6 +327,19 @@ class Neo4jPreparationStep:
                                 # Also copy to data/output for compatibility
                                 alt_dst = os.path.join(alt_output_dir, filename)
                                 shutil.copy2(src_file, alt_dst)
+
+                                support_key = filename.lower()
+                                if support_key in support_targets:
+                                    relative_target = support_targets[support_key]
+                                    support_path = os.path.join(event_root_dir, relative_target)
+                                    target_dir = os.path.dirname(support_path)
+                                    if target_dir:
+                                        os.makedirs(target_dir, exist_ok=True)
+                                    shutil.copy2(src_file, support_path)
+                                    support_status[support_key] = True
+                                    self.logger.info(
+                                        f"Copied Neo4j support file {filename} to {support_path}"
+                                    )
             
             # CRITICAL: Change working directory to azureml_pipeline
             # This is necessary because the PA processors use relative paths
@@ -319,6 +368,12 @@ class Neo4jPreparationStep:
             
             if copied_files:
                 self.logger.info(f"Successfully prepared {len(copied_files)} files for Neo4j processing")
+                missing_support = [name for name, found in support_status.items() if not found]
+                if missing_support:
+                    self.logger.warning(
+                        "Missing Neo4j support files from Step 1 payload: %s",
+                        ', '.join(missing_support),
+                    )
                 return True
             else:
                 self.logger.warning("No files were copied from Step 1 outputs")

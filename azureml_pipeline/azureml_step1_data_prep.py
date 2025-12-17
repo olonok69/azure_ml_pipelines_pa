@@ -268,6 +268,44 @@ class DataPreparationStep:
         config['env_file'] = temp_env_path
         self.logger.info(f"Created temporary environment file at {temp_env_path}")
 
+    def _activate_vet_specific_functions(self, processor: RegistrationProcessor) -> bool:
+        """Apply veterinary-specific overrides when the config targets a vet show."""
+        event_cfg = self.config.get('event', {}) or {}
+        main_event_name = str(
+            event_cfg.get('main_event_name')
+            or event_cfg.get('name')
+            or ''
+        ).lower()
+
+        if main_event_name not in {'bva', 'lva'}:
+            self.logger.info(
+                "Registration processor running with generic logic for event '%s'",
+                main_event_name or 'unknown',
+            )
+            return False
+
+        try:
+            from utils import vet_specific_functions  # type: ignore
+        except ImportError:
+            from PA.utils import vet_specific_functions  # type: ignore
+
+        self.logger.info(
+            "Applying veterinary-specific registration overrides for event '%s'",
+            main_event_name,
+        )
+
+        try:
+            vet_specific_functions.add_vet_specific_methods(processor)
+            if vet_specific_functions.verify_vet_functions_applied(processor):
+                processor.logger.info("Veterinary-specific functions active for this run")
+                return True
+
+            self.logger.error("Failed to verify veterinary-specific overrides on processor")
+        except Exception as exc:
+            self.logger.error("Error activating veterinary-specific functions: %s", exc, exc_info=True)
+
+        return False
+
     def download_blob_data(self, uri_or_path: str, local_dir: str) -> List[str]:
         """
         Download data from Azure Blob Storage or copy from mounted path.
@@ -383,6 +421,27 @@ class DataPreparationStep:
             normalized = normalized[2:]
         return normalized.lstrip("/")
 
+    def _resolve_existing_path(self, path_value: str) -> Optional[str]:
+        """Resolve a config-declared path to an existing absolute path if possible."""
+        if not path_value:
+            return None
+
+        candidates: List[str] = []
+        cleaned = str(path_value).strip()
+
+        if os.path.isabs(cleaned):
+            candidates.append(os.path.normpath(cleaned))
+        else:
+            normalized_rel = self._normalize_config_path(cleaned)
+            candidates.append(os.path.normpath(os.path.join(root_dir, normalized_rel)))
+            candidates.append(os.path.normpath(os.path.join(project_root, normalized_rel)))
+
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+
+        return None
+
     def _build_config_file_index(self) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, List[Dict[str, Any]]]]:
         """Create lookup tables for config-defined input files."""
         sections: Dict[str, Any] = {
@@ -395,6 +454,16 @@ class DataPreparationStep:
         for pa_section in ('scan_files', 'entry_scan_files'):
             if pa_section in post_analysis_config:
                 sections[f'post_analysis_mode.{pa_section}'] = post_analysis_config.get(pa_section)
+
+        neo4j_cfg = self.config.get('neo4j', {}) or {}
+        additional_sources = {
+            'neo4j.job_stream_mapping.file': (neo4j_cfg.get('job_stream_mapping', {}) or {}).get('file'),
+            'neo4j.specialization_stream_mapping.file': (neo4j_cfg.get('specialization_stream_mapping', {}) or {}).get('file'),
+        }
+
+        for section_name, value in additional_sources.items():
+            if value:
+                sections[section_name] = value
 
         name_index: Dict[str, List[Dict[str, Any]]] = {}
         path_lookup: Dict[str, List[Dict[str, Any]]] = {}
@@ -531,6 +600,33 @@ class DataPreparationStep:
 
         collection.append((normalized_source, destination))
 
+    def _get_neo4j_support_files(self) -> List[Tuple[str, str]]:
+        """Return absolute paths for Neo4j mapping files required downstream."""
+        support_files: List[Tuple[str, str]] = []
+        neo4j_cfg = self.config.get('neo4j', {})
+
+        job_stream_file = (neo4j_cfg.get('job_stream_mapping', {}) or {}).get('file')
+        specialization_file = (neo4j_cfg.get('specialization_stream_mapping', {}) or {}).get('file')
+
+        for label, path_value in (
+            ('job stream', job_stream_file),
+            ('specialization', specialization_file),
+        ):
+            if not path_value:
+                continue
+
+            resolved = self._resolve_existing_path(path_value)
+            if resolved:
+                support_files.append((resolved, os.path.basename(resolved)))
+            else:
+                self.logger.warning(
+                    "Neo4j %s mapping file declared but not found: %s",
+                    label,
+                    path_value,
+                )
+
+        return support_files
+
     def _build_output_file_mappings(self) -> Dict[str, List[Tuple[str, str]]]:
         """Construct Azure output mappings based on config-defined artifacts."""
         mappings: Dict[str, List[Tuple[str, str]]] = {
@@ -592,6 +688,12 @@ class DataPreparationStep:
         self._append_output_file(mappings['output_session'], standard_output_dir, 'streams.csv', dest_name='streams.csv')
         self._append_output_file(mappings['output_session'], standard_output_dir, 'streams_cache.json', dest_name='streams_cache.json')
 
+        neo4j_support_files = self._get_neo4j_support_files()
+        if neo4j_support_files:
+            session_bucket = mappings.setdefault('output_session', [])
+            for abs_path, dest_name in neo4j_support_files:
+                session_bucket.append((abs_path, dest_name))
+
         # Remove empty mappings to avoid unnecessary copy attempts
         return {key: value for key, value in mappings.items() if value}
     
@@ -635,6 +737,10 @@ class DataPreparationStep:
         
         try:
             processor = RegistrationProcessor(self.config)
+
+            vet_active = self._activate_vet_specific_functions(processor)
+            if vet_active:
+                self.logger.info("Veterinary-specific registration logic enabled for this run")
             
             if self.config.get('processors', {}).get('registration_processing', {}).get('enabled', True):
                 processor.process()
@@ -849,6 +955,7 @@ class DataPreparationStep:
         """
         self.logger.info("Saving outputs to Azure ML paths")
         self.logger.info(f"Output paths provided: {output_paths}")
+        event_name = self.config.get('event', {}).get('name', 'ecomm')
         
         file_mappings = self._build_output_file_mappings()
         output_root = self._resolve_output_directory()
