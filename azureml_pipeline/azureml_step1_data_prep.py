@@ -639,6 +639,26 @@ class DataPreparationStep:
         standard_output_dir = os.path.join(output_root, 'output')
 
         output_files = self.config.get('output_files', {})
+        session_bucket = mappings['output_session']
+
+        def _append_support_file(path_value: Optional[str], context: str) -> None:
+            """Ensure supplemental config files are copied alongside session outputs."""
+            if not path_value:
+                return
+
+            resolved = self._resolve_existing_path(path_value)
+            if resolved:
+                dest_name = os.path.basename(resolved)
+                session_bucket.append((resolved, dest_name))
+                self.logger.info(
+                    "Queued %s for session output transfer: %s", context, dest_name
+                )
+            else:
+                self.logger.warning(
+                    "Config-declared %s file not found prior to copy: %s",
+                    context,
+                    path_value,
+                )
 
         combined_registration = output_files.get('combined_demographic_registration', {})
         for key in ('this_year', 'last_year_main', 'last_year_secondary'):
@@ -677,22 +697,32 @@ class DataPreparationStep:
         processed_sessions = session_outputs.get('processed_sessions', {})
         for key in ('this_year', 'last_year_main', 'last_year_secondary'):
             self._append_output_file(
-                mappings['output_session'], standard_output_dir, processed_sessions.get(key)
+                session_bucket, standard_output_dir, processed_sessions.get(key)
             )
 
         streams_catalog = session_outputs.get('streams_catalog')
-        self._append_output_file(mappings['output_session'], standard_output_dir, streams_catalog,
+        self._append_output_file(session_bucket, standard_output_dir, streams_catalog,
                                  dest_name=os.path.basename(streams_catalog) if streams_catalog else None)
 
         # Legacy fallback files that may not be explicitly declared in config
-        self._append_output_file(mappings['output_session'], standard_output_dir, 'streams.csv', dest_name='streams.csv')
-        self._append_output_file(mappings['output_session'], standard_output_dir, 'streams_cache.json', dest_name='streams_cache.json')
+        self._append_output_file(session_bucket, standard_output_dir, 'streams.csv', dest_name='streams.csv')
+        self._append_output_file(session_bucket, standard_output_dir, 'streams_cache.json', dest_name='streams_cache.json')
 
         neo4j_support_files = self._get_neo4j_support_files()
         if neo4j_support_files:
-            session_bucket = mappings.setdefault('output_session', [])
             for abs_path, dest_name in neo4j_support_files:
                 session_bucket.append((abs_path, dest_name))
+
+        raw_session_inputs = self.config.get('session_files', {})
+        for key, value in (raw_session_inputs or {}).items():
+            _append_support_file(value, f"session_files.{key}")
+
+        theatre_limits_cfg = (self.config.get('recommendation', {}) or {}).get('theatre_capacity_limits', {}) or {}
+        for field_name in ('capacity_file', 'session_file'):
+            _append_support_file(
+                theatre_limits_cfg.get(field_name),
+                f"recommendation.theatre_capacity_limits.{field_name}"
+            )
 
         # Remove empty mappings to avoid unnecessary copy attempts
         return {key: value for key, value in mappings.items() if value}

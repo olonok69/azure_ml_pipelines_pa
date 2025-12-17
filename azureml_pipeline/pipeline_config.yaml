@@ -108,6 +108,9 @@ steps:
       config_file:
         type: "uri_file"
         path: "PA/config/config_${EVENT_TYPE}.yaml"
+      session_data:
+        type: "uri_folder"
+        source: "data_preparation.outputs.session_output"
     outputs:
       metadata_output:
         type: "uri_folder"

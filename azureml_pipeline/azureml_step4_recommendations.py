@@ -78,23 +78,34 @@ def configure_mlflow(logger):
 class RecommendationsStep:
     """Azure ML Recommendations Step for Personal Agendas pipeline."""
     
-    def __init__(self, config_path: str, incremental: bool = False, use_keyvault: bool = True):
+    def __init__(
+        self,
+        config_path: str,
+        incremental: bool = False,
+        session_data_path: Optional[str] = None,
+        use_keyvault: bool = True,
+    ):
         """
         Initialize the Recommendations Step.
         
         Args:
             config_path: Path to configuration file
             incremental: Whether to run incremental processing (create_only_new)
+            session_data_path: Optional mounted directory containing Step 1 session outputs
             use_keyvault: Whether to use Azure Key Vault for secrets
         """
         self.config_path = config_path
         self.incremental = incremental
         self.use_keyvault = use_keyvault
+        self.session_data_path = Path(session_data_path) if session_data_path else None
         self.logger = self._setup_logging()
 
         # Load config early
         self.config = self._load_configuration(config_path)
         self.create_only_new = self.incremental
+
+        if self.session_data_path:
+            self._remap_session_support_files()
 
         # Robust secret load (non-fatal). Do not declare success unless something found.
         if self.use_keyvault and self._is_azure_ml_environment():
@@ -215,6 +226,64 @@ class RecommendationsStep:
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
         return logging.getLogger(__name__)
+
+    def _remap_session_support_files(self) -> None:
+        """Point config-declared session files to the mounted Step 1 outputs."""
+        if not self.session_data_path:
+            return
+
+        mount_path = self.session_data_path
+        if not mount_path.exists():
+            self.logger.warning(
+                "Session data mount %s not found; theatre/session overrides will use original config paths",
+                mount_path,
+            )
+            return
+
+        file_lookup: Dict[str, Path] = {}
+        for file_path in mount_path.rglob('*'):
+            if file_path.is_file():
+                file_lookup[file_path.name.lower()] = file_path
+
+        if not file_lookup:
+            self.logger.warning(
+                "Session data mount %s contains no files; unable to remap support artifacts",
+                mount_path,
+            )
+            return
+
+        def _maybe_remap(path_value: Optional[str], context: str) -> Optional[str]:
+            if not path_value:
+                return path_value
+
+            filename = os.path.basename(str(path_value)).lower()
+            matched = file_lookup.get(filename)
+            if matched:
+                new_path = str(matched)
+                if new_path != path_value:
+                    self.logger.info("Remapped %s to %s", context, new_path)
+                return new_path
+
+            self.logger.warning(
+                "Missing %s in session output mount; expected file named %s",
+                context,
+                filename,
+            )
+            return path_value
+
+        session_files_cfg = self.config.get('session_files', {}) or {}
+        for key, value in list(session_files_cfg.items()):
+            if isinstance(value, str):
+                session_files_cfg[key] = _maybe_remap(value, f"session_files.{key}")
+
+        recommendation_cfg = self.config.get('recommendation', {}) or {}
+        theatre_cfg = recommendation_cfg.get('theatre_capacity_limits', {}) or {}
+        for field in ('capacity_file', 'session_file'):
+            if field in theatre_cfg:
+                theatre_cfg[field] = _maybe_remap(
+                    theatre_cfg.get(field),
+                    f"recommendation.theatre_capacity_limits.{field}"
+                )
     
     def _get_azure_credential(self):
         """
@@ -654,7 +723,11 @@ def main(args):
     load_dotenv()
     
     # Initialize step
-    step = RecommendationsStep(args.config, args.incremental)
+    step = RecommendationsStep(
+        args.config,
+        args.incremental,
+        session_data_path=args.session_data,
+    )
     
     # Run processing
     try:
@@ -750,6 +823,12 @@ def parse_args():
         type=str,
         required=True,
         help="Output directory for metadata and results"
+    )
+
+    parser.add_argument(
+        "--session_data",
+        type=str,
+        help="Path to mounted session data artifacts from Step 1"
     )
     
     return parser.parse_args()
