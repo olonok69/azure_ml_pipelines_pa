@@ -741,6 +741,19 @@ class DataPreparationStep:
             vet_active = self._activate_vet_specific_functions(processor)
             if vet_active:
                 self.logger.info("Veterinary-specific registration logic enabled for this run")
+                practices_path = (self.config.get('input_files', {}) or {}).get('practices')
+                if practices_path:
+                    resolved_practices = self._resolve_existing_path(practices_path)
+                    if resolved_practices:
+                        self.logger.info(
+                            "Practice-matching dataset detected for AML run: %s",
+                            resolved_practices,
+                        )
+                    else:
+                        self.logger.warning(
+                            "Practice-matching dataset declared (%s) but not found before processing",
+                            practices_path,
+                        )
             
             if self.config.get('processors', {}).get('registration_processing', {}).get('enabled', True):
                 processor.process()
