@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 _APP_INSIGHTS_SENTINEL = "_PA_APP_INSIGHTS_CONFIGURED"
 _RESOURCE_CREATE_PATCHED = False
+_LOG_FACTORY_PATCHED = False
 
 
 def _resolve_connection_string() -> Optional[str]:
@@ -71,6 +72,36 @@ def ensure_resource_factory(log: Optional[logging.Logger] = None) -> None:
     _RESOURCE_CREATE_PATCHED = True
 
 
+def ensure_source_context_in_logs(
+    log: Optional[logging.Logger] = None,
+) -> None:
+    """Augment Python log records with file/method/line metadata."""
+
+    global _LOG_FACTORY_PATCHED
+
+    if _LOG_FACTORY_PATCHED:
+        return
+
+    baseline_factory = logging.getLogRecordFactory()
+    emitter = log or logging.getLogger("pa.app_insights")
+
+    def _factory(*args: Any, **kwargs: Any) -> logging.LogRecord:  # type: ignore[name-defined]
+        record = baseline_factory(*args, **kwargs)
+        location = f"{record.pathname}:{record.funcName}:{record.lineno}"
+        record.ai_source_location = location
+        record.ai_source_file = record.pathname
+        record.ai_source_function = record.funcName
+        record.ai_source_line = record.lineno
+        if not getattr(record, "_pa_ai_prefixed", False):
+            record.msg = f"[{location}] {record.msg}"
+            record._pa_ai_prefixed = True
+        return record
+
+    logging.setLogRecordFactory(_factory)
+    _LOG_FACTORY_PATCHED = True
+    emitter.debug("Log record factory patched to include source context for Application Insights")
+
+
 def configure_app_insights(
     service_name: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
@@ -90,6 +121,7 @@ def configure_app_insights(
     """
 
     log = logger or logging.getLogger("pa.app_insights")
+    ensure_source_context_in_logs(log)
 
     # If we've already configured telemetry, optionally refresh service name and exit
     if os.environ.get(_APP_INSIGHTS_SENTINEL):
