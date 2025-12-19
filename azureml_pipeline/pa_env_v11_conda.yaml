@@ -1,0 +1,65 @@
+name: pa-env
+channels:
+- conda-forge
+dependencies:
+- python=3.10
+- pip
+- pip:
+  - aiohttp==3.10.11
+  - opentelemetry-api>=1.10.0
+  - opentelemetry-sdk>=1.10.0
+  - azure-monitor-opentelemetry
+  - fastapi==0.115.12
+  - fuzzywuzzy==0.18.0
+  - httpx==0.28.1
+  - httpx-sse==0.4.0
+  - ipykernel==6.29.5
+  - ipython==8.31.0
+  - ipywidgets==8.1.5
+  - jupyter==1.1.1
+  - jupyterlab==4.3.4
+  - langchain==0.3.23
+  - langchain-community==0.3.21
+  - langchain-core==0.3.51
+  - langchain-openai==0.3.12
+  - langchain-text-splitters==0.3.8
+  - neo4j==5.28.1
+  - numpy==2.2.2
+  - openai==1.73.0
+  - orjson==3.10.16
+  - pandas==2.2.3
+  - pydantic==2.11.3
+  - pydantic-settings==2.8.1
+  - pydantic_core==2.33.1
+  - PyYAML==6.0.2
+  - sentence-transformers==4.0.2
+  - tiktoken==0.9.0
+  - transformers==4.51.3
+  - huggingface_hub[hf_xet]
+  - azure-ai-ml==1.20.0
+  - azureml-fsspec==1.3.0
+  - azureml-mlflow==1.59.0
+  - mltable==1.6.1
+  - azure-identity==1.17.1
+  - azure-keyvault-secrets==4.9.0
+  - azure-monitor-opentelemetry==1.5.0
+  - azure-monitor-opentelemetry-exporter==1.0.0b26
+  - azure-core-tracing-opentelemetry==1.0.0b11
+  - opentelemetry-api==1.21.0
+  - opentelemetry-sdk==1.21.0
+  - opentelemetry-instrumentation==0.42b0
+  - opentelemetry-instrumentation-django==0.42b0
+  - opentelemetry-instrumentation-fastapi==0.42b0
+  - opentelemetry-instrumentation-flask==0.42b0
+  - opentelemetry-instrumentation-psycopg2==0.42b0
+  - opentelemetry-instrumentation-requests==0.42b0
+  - opentelemetry-instrumentation-urllib==0.42b0
+  - opentelemetry-instrumentation-urllib3==0.42b0
+  - opentelemetry-instrumentation-wsgi==0.42b0
+  - opentelemetry-semantic-conventions==0.42b0
+  - opentelemetry-util-http==0.42b0
+  - opentelemetry-resource-detector-azure==0.1.4
+  - python-dotenv==1.0.1
+  - mlflow-skinny
+  - seaborn>=0.11.0
+  - torch==2.5.1
