@@ -43,6 +43,7 @@ from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
 from PA.utils.app_insights import configure_app_insights
 from neo4j_env_utils import apply_neo4j_credentials
+from step_input_sync import stage_step1_outputs
 
 
 class SessionEmbeddingStep:
@@ -305,6 +306,16 @@ def main(args):
     try:
         # Initialize the step
         step = SessionEmbeddingStep(args.config, args.incremental)
+
+        input_paths = {
+            'input_registration': args.input_registration,
+            'input_scan': args.input_scan,
+            'input_session': args.input_session,
+        }
+
+        if any(input_paths.values()):
+            data_dir = os.path.join(root_dir, 'data')
+            stage_step1_outputs(step.config, input_paths, data_dir, step.logger)
         
         # Run session embedding step
         results = step.process()
@@ -382,6 +393,24 @@ def parse_args():
         type=str,
         required=True,
         help="Output directory for metadata and results"
+    )
+
+    parser.add_argument(
+        "--input_registration",
+        type=str,
+        help="Path to Step 1 registration outputs"
+    )
+
+    parser.add_argument(
+        "--input_scan",
+        type=str,
+        help="Path to Step 1 scan outputs"
+    )
+
+    parser.add_argument(
+        "--input_session",
+        type=str,
+        help="Path to Step 1 session outputs"
     )
     
     return parser.parse_args()

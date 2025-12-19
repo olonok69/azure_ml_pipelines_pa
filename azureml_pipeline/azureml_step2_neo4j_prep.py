@@ -7,7 +7,6 @@ Processes visitor, session, job stream, specialization stream, and relationship 
 import os
 import sys
 import json
-import shutil
 import argparse
 import logging
 import traceback
@@ -47,6 +46,7 @@ from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
 from PA.utils.app_insights import configure_app_insights
 from neo4j_env_utils import apply_neo4j_credentials
+from step_input_sync import stage_step1_outputs
 
 
 class Neo4jPreparationStep:
@@ -251,136 +251,53 @@ class Neo4jPreparationStep:
             True if successful, False otherwise
         """
         try:
-            # Get event name from config
-            event_name = self.config.get('event', {}).get('name', 'ecomm')
-            
-            # Create the expected directory structure
-            # Neo4j processors look in data/ecomm/output/
-            event_root_dir = os.path.join(data_dir, event_name)
-            output_dir = os.path.join(event_root_dir, 'output')
-            os.makedirs(output_dir, exist_ok=True)
-            self.logger.info(f"Created output directory: {output_dir}")
-            
-            # Also create the data/output directory as Step 1 may have created files there
-            alt_output_dir = os.path.join(data_dir, 'output')
-            os.makedirs(alt_output_dir, exist_ok=True)
-            os.makedirs(event_root_dir, exist_ok=True)
-            
-            # Track all copied files
-            copied_files = []
-            support_targets = self._get_neo4j_support_targets(event_name)
-            support_status = {key: False for key in support_targets.keys()}
-            
-            # Debug: List what's in each input path
-            for input_key in ['input_registration', 'input_scan', 'input_session']:
-                if input_key in input_paths and input_paths[input_key]:
-                    input_path = input_paths[input_key]
-                    self.logger.info(f"Checking {input_key} at: {input_path}")
-                    
-                    if os.path.exists(input_path) and os.path.isdir(input_path):
-                        files = os.listdir(input_path)
-                        self.logger.info(f"  Found {len(files)} files: {files}")
-                    else:
-                        self.logger.warning(f"  Path does not exist or is not a directory")
-            
-            # Copy from Step 1 output directories
-            # These are the files Step 1 should produce based on the processors
+            support_targets = self._get_neo4j_support_targets(
+                self.config.get('event', {}).get('name', 'ecomm')
+            )
             expected_files = {
-                # Registration processor outputs (in data/output/)
-                'df_reg_demo_this.csv': 'df_reg_demo_this.csv',
-                'df_reg_demo_last_bva.csv': 'df_reg_demo_last_bva.csv',
-                'df_reg_demo_last_lva.csv': 'df_reg_demo_last_lva.csv',
-                
-                # Session processor outputs (in data/output/output/)
-                'session_this_filtered_valid_cols.csv': 'session_this_filtered_valid_cols.csv',
-                'session_last_filtered_valid_cols_bva.csv': 'session_last_filtered_valid_cols_bva.csv',
-                'session_last_filtered_valid_cols_lva.csv': 'session_last_filtered_valid_cols_lva.csv',
-                
-                # Scan processor outputs
-                'scan_this_filtered_valid_cols.csv': 'scan_this_filtered_valid_cols.csv',
-                'scan_bva_past.csv': 'scan_bva_past.csv',
-                'scan_lva_past.csv': 'scan_lva_past.csv',
-                'sessions_visited_last_bva.csv': 'sessions_visited_last_bva.csv',
-                'sessions_visited_last_lva.csv': 'sessions_visited_last_lva.csv',
-                
-                # Streams file from session processor
-                'streams.csv': 'streams.csv',
-                'streams.json': 'streams.json'
-            }
-            
-            # Try to find and copy files from any of the input paths
-            for input_key in ['input_registration', 'input_scan', 'input_session']:
-                if input_key in input_paths and input_paths[input_key]:
-                    input_path = input_paths[input_key]
-                    
-                    if os.path.exists(input_path) and os.path.isdir(input_path):
-                        # Look for expected files
-                        for filename in os.listdir(input_path):
-                            src_file = os.path.join(input_path, filename)
-                            
-                            if os.path.isfile(src_file):
-                                # Copy to the event output directory
-                                dst_file = os.path.join(output_dir, filename)
-                                shutil.copy2(src_file, dst_file)
-                                copied_files.append(filename)
-                                self.logger.info(f"Copied {filename} to {output_dir}")
-                                
-                                # Also copy to data/output for compatibility
-                                alt_dst = os.path.join(alt_output_dir, filename)
-                                shutil.copy2(src_file, alt_dst)
+                # Registration outputs
+                'df_reg_demo_this.csv': ['df_reg_demo_this.csv'],
+                'df_reg_demo_last_bva.csv': ['df_reg_demo_last_bva.csv'],
+                'df_reg_demo_last_lva.csv': ['df_reg_demo_last_lva.csv'],
+                'registration_data_with_demographicdata_bva_this.csv': ['Registration_data_with_demographicdata_bva_this.csv'],
+                'registration_data_with_demographicdata_bva_last.csv': ['Registration_data_with_demographicdata_bva_last.csv'],
+                'registration_data_with_demographicdata_lva_last.csv': ['Registration_data_with_demographicdata_lva_last.csv'],
+                'registration_data_with_demographicdata_lva_this.csv': ['Registration_data_with_demographicdata_lva_this.csv'],
 
-                                support_key = filename.lower()
-                                if support_key in support_targets:
-                                    relative_target = support_targets[support_key]
-                                    support_path = os.path.join(event_root_dir, relative_target)
-                                    target_dir = os.path.dirname(support_path)
-                                    if target_dir:
-                                        os.makedirs(target_dir, exist_ok=True)
-                                    shutil.copy2(src_file, support_path)
-                                    support_status[support_key] = True
-                                    self.logger.info(
-                                        f"Copied Neo4j support file {filename} to {support_path}"
-                                    )
-            
-            # CRITICAL: Change working directory to azureml_pipeline
-            # This is necessary because the PA processors use relative paths
+                # Scan outputs
+                'sessions_visited_last_bva.csv': ['sessions_visited_last_bva.csv'],
+                'sessions_visited_last_lva.csv': ['sessions_visited_last_lva.csv'],
+                'scan_bva_past.csv': ['scan_bva_past.csv'],
+                'scan_lva_past.csv': ['scan_lva_past.csv'],
+
+                # Session outputs
+                'session_this_filtered_valid_cols.csv': ['session_this_filtered_valid_cols.csv'],
+                'session_last_filtered_valid_cols_bva.csv': ['session_last_filtered_valid_cols_bva.csv'],
+                'session_last_filtered_valid_cols_lva.csv': ['session_last_filtered_valid_cols_lva.csv'],
+                'streams.json': ['streams.json'],
+                'streams_cache.json': ['streams_cache.json'],
+                'job_to_stream.csv': ['job_to_stream.csv'],
+                'spezialization_to_stream.csv': ['spezialization_to_stream.csv'],
+                'teatres.csv': ['teatres.csv'],
+                'bva25_session_export.csv': ['BVA25_session_export.csv'],
+                'lvs24_session_export.csv': ['LVS24_session_export.csv'],
+                'lvs25_session_export.csv': ['LVS25_session_export.csv'],
+            }
+
+            result = stage_step1_outputs(
+                self.config,
+                input_paths,
+                data_dir,
+                self.logger,
+                support_targets=support_targets,
+                expected_files=expected_files,
+            )
+
             os.chdir(root_dir)
-            self.logger.info(f"Changed working directory to: {root_dir}")
-            
-            # Now check if the expected files exist in the right locations
-            missing_files = []
-            for expected_file in expected_files.keys():
-                file_path = os.path.join(output_dir, expected_file)
-                if not os.path.exists(file_path):
-                    # Try alternate names and locations
-                    alt_path = os.path.join(alt_output_dir, expected_file)
-                    if os.path.exists(alt_path):
-                        # Copy to expected location
-                        shutil.copy2(alt_path, file_path)
-                        self.logger.info(f"Copied {expected_file} from alternate location")
-                        copied_files.append(expected_file)
-                    else:
-                        missing_files.append(expected_file)
-                        self.logger.warning(f"Missing expected file: {expected_file}")
-            
-            if missing_files:
-                self.logger.warning(f"Missing {len(missing_files)} expected files: {missing_files}")
-                self.logger.warning("Neo4j processors may fail due to missing input files")
-            
-            if copied_files:
-                self.logger.info(f"Successfully prepared {len(copied_files)} files for Neo4j processing")
-                missing_support = [name for name, found in support_status.items() if not found]
-                if missing_support:
-                    self.logger.warning(
-                        "Missing Neo4j support files from Step 1 payload: %s",
-                        ', '.join(missing_support),
-                    )
-                return True
-            else:
-                self.logger.warning("No files were copied from Step 1 outputs")
-                self.logger.warning("This indicates Step 1 may not have completed successfully")
-                return False
-                
+            self.logger.info("Changed working directory to: %s", root_dir)
+
+            return bool(result.copied_files)
+
         except Exception as e:
             self.logger.error(f"Error copying input data: {e}")
             traceback.print_exc()

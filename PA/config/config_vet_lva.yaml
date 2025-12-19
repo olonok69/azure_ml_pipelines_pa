@@ -219,6 +219,8 @@ map_vets:
   "IVAPM": "International Veterinary Academy of Pain Management"
   "KRKA": "KRKA Pharmaceutical"
   "VESH": "VETERINARY EMERGENCY AND SPECIALTY HOSPITAL LONDON"
+  "MWI": "MWI Animal Health"
+  "AITEM": "Artificial Intelligence Technologies Multipurpose"
 
 # Embedding configuration
 embeddings:

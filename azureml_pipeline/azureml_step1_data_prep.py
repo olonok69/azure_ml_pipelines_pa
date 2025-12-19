@@ -165,6 +165,57 @@ class DataPreparationStep:
             }
         
         return config
+
+    def _output_source_roots(self, event_name: str) -> List[Path]:
+        roots: List[Path] = []
+        event_root = Path(root_dir) / 'data' / event_name / 'output'
+        if event_root.exists():
+            roots.append(event_root)
+
+        generic_root = Path(root_dir) / 'data' / 'output'
+        if generic_root.exists():
+            roots.append(generic_root)
+
+        return roots
+
+    def _collect_output_files(self, event_name: str) -> Dict[str, Path]:
+        file_index: Dict[str, Path] = {}
+        for source_root in self._output_source_roots(event_name):
+            for artifact in source_root.rglob('*'):
+                if artifact.is_file():
+                    key = artifact.name.lower()
+                    if key not in file_index:
+                        file_index[key] = artifact
+        return file_index
+
+    def _categorize_output_file(self, filename: str) -> List[str]:
+        name = filename.lower()
+        categories: List[str] = []
+
+        if (
+            name.startswith('registration_')
+            or name.startswith('df_reg_')
+            or name.startswith('demographic_')
+            or 'registration' in name
+        ):
+            categories.append('registration')
+
+        if (
+            name.startswith('scan_')
+            or name.startswith('sessions_visited')
+            or 'scan_' in name
+        ):
+            categories.append('scan')
+
+        if (
+            name.startswith('session_')
+            or name.endswith('_session_export.csv')
+            or 'stream' in name
+            or 'teatre' in name
+        ):
+            categories.append('session')
+
+        return categories
     
     def copy_outputs_to_azure_ml(self, output_paths: Dict[str, str]) -> None:
         """
@@ -177,60 +228,65 @@ class DataPreparationStep:
         self.logger.info("Copying outputs to Azure ML directories for next steps")
         
         event_name = self.config.get('event', {}).get('name', 'ecomm')
-        
-        # Map local files to Azure ML outputs
-        # These mappings ensure Step 2 finds the files with expected names
-        file_mappings = {
-            'output_registration': [
-                # Registration outputs from data/{event}/output/
-                (f'data/{event_name}/output/df_reg_demo_this.csv', 'df_reg_demo_this.csv'),
-                (f'data/{event_name}/output/df_reg_demo_last_bva.csv', 'df_reg_demo_last_bva.csv'),
-                (f'data/{event_name}/output/df_reg_demo_last_lva.csv', 'df_reg_demo_last_lva.csv'),
-            ],
-            'output_scan': [
-                # Scan outputs - note the name mappings for ecomm
-                (f'data/{event_name}/output/sessions_visited_last_bva.csv', 'sessions_visited_last_bva.csv'),
-                (f'data/{event_name}/output/sessions_visited_last_lva.csv', 'sessions_visited_last_lva.csv'),
-                # Also try the alternate names
-                (f'data/{event_name}/output/sessions_with_demo_ecomm.csv', 'scan_last_filtered_valid_cols_ecomm.csv'),
-                (f'data/{event_name}/output/sessions_with_demo_tfm.csv', 'scan_last_filtered_valid_cols_tfm.csv'),
-                (f'data/{event_name}/output/scan_bva_past.csv', 'scan_bva_past.csv'),
-                (f'data/{event_name}/output/scan_lva_past.csv', 'scan_lva_past.csv'),
-            ],
-            'output_session': [
-                # Session outputs from data/{event}/output/
-                (f'data/{event_name}/output/session_this_filtered_valid_cols.csv', 'session_this_filtered_valid_cols.csv'),
-                (f'data/{event_name}/output/session_last_filtered_valid_cols_bva.csv', 'session_last_filtered_valid_cols_bva.csv'),
-                (f'data/{event_name}/output/session_last_filtered_valid_cols_lva.csv', 'session_last_filtered_valid_cols_lva.csv'),
-                (f'data/{event_name}/output/streams.json', 'streams.json'),
-                (f'data/{event_name}/output/streams.csv', 'streams.csv'),
-            ]
+
+        file_index = self._collect_output_files(event_name)
+        if not file_index:
+            self.logger.warning(
+                "No processor outputs discovered for event '%s'; nothing to copy to Azure ML outputs",
+                event_name,
+            )
+            return
+
+        category_to_output = {
+            'registration': 'output_registration',
+            'scan': 'output_scan',
+            'session': 'output_session',
         }
-        
-        # Copy files to appropriate Azure ML output directories
-        for output_key, files in file_mappings.items():
-            if output_key in output_paths and output_paths[output_key]:
-                output_path = output_paths[output_key]
-                os.makedirs(output_path, exist_ok=True)
-                self.logger.info(f"Copying {output_key} files to: {output_path}")
-                
-                for src_relative, dest_name in files:
-                    # Try the primary location
-                    src_path = os.path.join(root_dir, src_relative)
-                    
-                    if os.path.exists(src_path):
-                        dest_path = os.path.join(output_path, dest_name)
-                        shutil.copy2(src_path, dest_path)
-                        self.logger.info(f"  Copied {dest_name}")
-                    else:
-                        # Try alternate location (directly in data/output)
-                        alt_src = os.path.join(root_dir, 'data', 'output', dest_name)
-                        if os.path.exists(alt_src):
-                            dest_path = os.path.join(output_path, dest_name)
-                            shutil.copy2(alt_src, dest_path)
-                            self.logger.info(f"  Copied {dest_name} from alt location")
-                        else:
-                            self.logger.warning(f"  File not found: {src_relative}")
+
+        category_counts = {key: 0 for key in category_to_output.keys()}
+        unclassified: List[Path] = []
+
+        for file_key, source_path in file_index.items():
+            categories = self._categorize_output_file(source_path.name)
+            if not categories:
+                unclassified.append(source_path)
+                continue
+
+            for category in categories:
+                output_key = category_to_output.get(category)
+                destination_dir = output_paths.get(output_key)
+                if not destination_dir:
+                    continue
+
+                Path(destination_dir).mkdir(parents=True, exist_ok=True)
+                dest_path = Path(destination_dir) / source_path.name
+                shutil.copy2(source_path, dest_path)
+                category_counts[category] += 1
+                self.logger.info(
+                    "Copied %s to %s",
+                    source_path.name,
+                    destination_dir,
+                )
+
+        if unclassified:
+            fallback_dir = output_paths.get('output_session') or output_paths.get('output_scan')
+            if fallback_dir:
+                Path(fallback_dir).mkdir(parents=True, exist_ok=True)
+                for source_path in unclassified:
+                    shutil.copy2(source_path, Path(fallback_dir) / source_path.name)
+                self.logger.info(
+                    "Copied %s unclassified files to %s",
+                    len(unclassified),
+                    fallback_dir,
+                )
+            else:
+                self.logger.warning(
+                    "%s files could not be categorized and no fallback output was available",
+                    len(unclassified),
+                )
+
+        for category, count in category_counts.items():
+            self.logger.info("Category '%s' -> %s files", category, count)
 
     def _create_temp_env_file(self, config: Dict[str, Any]) -> None:
         """

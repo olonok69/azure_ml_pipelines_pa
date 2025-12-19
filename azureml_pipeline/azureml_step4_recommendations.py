@@ -53,6 +53,7 @@ from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
 from PA.utils.app_insights import configure_app_insights
 from neo4j_env_utils import apply_neo4j_credentials
+from step_input_sync import stage_step1_outputs
 import mlflow
 from neo4j import GraphDatabase
 
@@ -85,6 +86,8 @@ class RecommendationsStep:
         config_path: str,
         incremental: bool = False,
         session_data_path: Optional[str] = None,
+        registration_data_path: Optional[str] = None,
+        scan_data_path: Optional[str] = None,
         input_data_uri: Optional[str] = None,
         use_keyvault: bool = True,
     ):
@@ -95,12 +98,18 @@ class RecommendationsStep:
             config_path: Path to configuration file
             incremental: Whether to run incremental processing (create_only_new)
             session_data_path: Optional mounted directory containing Step 1 session outputs
+            registration_data_path: Optional mounted directory containing Step 1 registration outputs
+            scan_data_path: Optional mounted directory containing Step 1 scan outputs
             use_keyvault: Whether to use Azure Key Vault for secrets
         """
         self.config_path = config_path
         self.incremental = incremental
         self.use_keyvault = use_keyvault
         self.session_data_path = Path(session_data_path) if session_data_path else None
+        self.registration_data_path = (
+            Path(registration_data_path) if registration_data_path else None
+        )
+        self.scan_data_path = Path(scan_data_path) if scan_data_path else None
         self.input_data_uri = input_data_uri
         self.logger = self._setup_logging()
 
@@ -108,7 +117,7 @@ class RecommendationsStep:
         self.config = self._load_configuration(config_path)
         self.create_only_new = self.incremental
 
-        if self.session_data_path:
+        if any([self.session_data_path, self.registration_data_path, self.scan_data_path]):
             self._remap_session_support_files()
 
         # Robust secret load (non-fatal). Do not declare success unless something found.
@@ -263,26 +272,40 @@ class RecommendationsStep:
 
     def _remap_session_support_files(self) -> None:
         """Point config-declared session files to the mounted Step 1 outputs."""
-        if not self.session_data_path:
-            return
+        mounts: List[Path] = [
+            path
+            for path in (
+                self.session_data_path,
+                self.registration_data_path,
+                self.scan_data_path,
+            )
+            if path and path.exists()
+        ]
 
-        mount_path = self.session_data_path
-        if not mount_path.exists():
-            self.logger.warning(
-                "Session data mount %s not found; theatre/session overrides will use original config paths",
-                mount_path,
+        if not mounts:
+            self.logger.info(
+                "No Step 1 mounts available for remapping support artifacts"
             )
             return
 
         file_lookup: Dict[str, Path] = {}
-        for file_path in mount_path.rglob('*'):
-            if file_path.is_file():
-                file_lookup[file_path.name.lower()] = file_path
+        for mount in mounts:
+            files_found = False
+            for file_path in mount.rglob('*'):
+                if not file_path.is_file():
+                    continue
+                files_found = True
+                key = file_path.name.lower()
+                if key not in file_lookup:
+                    file_lookup[key] = file_path
+            if not files_found:
+                self.logger.warning(
+                    "Step 1 mount %s contains no files; skipping", mount
+                )
 
         if not file_lookup:
             self.logger.warning(
-                "Session data mount %s contains no files; unable to remap support artifacts",
-                mount_path,
+                "No artifacts discovered across Step 1 mounts; remap skipped"
             )
             return
 
@@ -299,7 +322,7 @@ class RecommendationsStep:
                 return new_path
 
             self.logger.warning(
-                "Missing %s in session output mount; expected file named %s",
+                "Missing %s in Step 1 mounts; expected file named %s",
                 context,
                 filename,
             )
@@ -807,12 +830,25 @@ def main(args):
     configure_app_insights(service_name="pa_step4_recommendations")
     
     # Initialize step
+    session_mount = args.input_session or args.session_data
     step = RecommendationsStep(
         args.config,
         args.incremental,
-        session_data_path=args.session_data,
+        session_data_path=session_mount,
+        registration_data_path=args.input_registration,
+        scan_data_path=args.input_scan,
         input_data_uri=args.input_data_uri,
     )
+
+    payload_inputs = {
+        'input_registration': args.input_registration,
+        'input_scan': args.input_scan,
+        'input_session': session_mount,
+    }
+
+    if any(payload_inputs.values()):
+        data_dir = os.path.join(root_dir, 'data')
+        stage_step1_outputs(step.config, payload_inputs, data_dir, step.logger)
     
     # Run processing
     try:
@@ -909,6 +945,24 @@ def parse_args():
         type=str,
         required=True,
         help="Output directory for metadata and results"
+    )
+
+    parser.add_argument(
+        "--input_registration",
+        type=str,
+        help="Path to Step 1 registration outputs"
+    )
+
+    parser.add_argument(
+        "--input_scan",
+        type=str,
+        help="Path to Step 1 scan outputs"
+    )
+
+    parser.add_argument(
+        "--input_session",
+        type=str,
+        help="Path to Step 1 session outputs (overrides --session_data when provided)"
     )
 
     parser.add_argument(

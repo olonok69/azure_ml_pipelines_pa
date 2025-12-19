@@ -85,6 +85,15 @@ steps:
     depends_on:
       - "neo4j_preparation"
     inputs:
+      registration_data:
+        type: "uri_folder"
+        source: "data_preparation.outputs.registration_output"
+      scan_data:
+        type: "uri_folder"
+        source: "data_preparation.outputs.scan_output"
+      session_data:
+        type: "uri_folder"
+        source: "data_preparation.outputs.session_output"
       config_file:
         type: "uri_file"
         path: "PA/config/config_${EVENT_TYPE}.yaml"
@@ -108,6 +117,12 @@ steps:
       config_file:
         type: "uri_file"
         path: "PA/config/config_${EVENT_TYPE}.yaml"
+      registration_data:
+        type: "uri_folder"
+        source: "data_preparation.outputs.registration_output"
+      scan_data:
+        type: "uri_folder"
+        source: "data_preparation.outputs.scan_output"
       session_data:
         type: "uri_folder"
         source: "data_preparation.outputs.session_output"
