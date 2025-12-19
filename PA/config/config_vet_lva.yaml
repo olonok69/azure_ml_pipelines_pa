@@ -221,6 +221,7 @@ map_vets:
   "VESH": "VETERINARY EMERGENCY AND SPECIALTY HOSPITAL LONDON"
   "MWI": "MWI Animal Health"
   "AITEM": "Artificial Intelligence Technologies Multipurpose"
+  "Vedis": "Vedis Laboratories"
 
 # Embedding configuration
 embeddings:
