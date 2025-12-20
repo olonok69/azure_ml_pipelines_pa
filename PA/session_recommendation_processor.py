@@ -1979,7 +1979,10 @@ class SessionRecommendationProcessor:
             return df
             
         except Exception as e:
-            self.logger.error(f"Error converting JSON to DataFrame: {str(e)}")
+            self.logger.error(
+                f"Error converting JSON to DataFrame: {str(e)}",
+                exc_info=True,
+            )
             return pd.DataFrame()
 
     def _flag_overlapping_sessions(self, df: pd.DataFrame) -> pd.DataFrame:

@@ -493,30 +493,57 @@ class RecommendationsStep:
             result_dict = {'status': 'success', 'statistics': statistics, 'output_files': {}}
 
             show_name = self.config.get('event', {}).get('name', 'ecomm')
-            output_dir = Path(root_dir) / 'data' / 'output' / 'recommendations'
-            # Only match current show
             pattern = f"visitor_recommendations_{show_name}_*.json"
-            json_files = list(output_dir.glob(pattern))
 
-            if json_files:
-                most_recent_json = max(json_files, key=lambda p: p.stat().st_mtime)
-                result_dict['output_files']['json'] = str(most_recent_json)
-                # Optional companion formats
-                for ext in ('.csv', '.parquet'):
-                    candidate = most_recent_json.with_suffix(ext)
-                    if candidate.exists():
-                        result_dict['output_files'][ext.lstrip('.')] = str(candidate)
+            configured_root = Path(getattr(processor, 'output_dir', Path(root_dir) / 'data'))
+            candidate_dirs: List[Path] = [
+                configured_root / 'recommendations',
+                configured_root,
+                Path(root_dir) / 'data' / 'output' / 'recommendations',
+            ]
 
-                # Basic stats enrichment
-                try:
-                    with open(most_recent_json, 'r') as f:
-                        data = json.load(f)
-                        recs = data.get('recommendations', [])
-                        result_dict['statistics'].setdefault('total_rows', len(recs))
-                        # If structure is list of visitor objects, adjust as needed
-                        result_dict['statistics'].setdefault('unique_visitors', len(recs))
-                except Exception as e:
-                    self.logger.debug(f"Could not enrich statistics from JSON: {e}")
+            selected_dir: Optional[Path] = None
+            json_files: List[Path] = []
+            inspected: List[str] = []
+
+            for candidate in candidate_dirs:
+                if not candidate:
+                    continue
+                candidate = candidate.resolve()
+                if not candidate.exists():
+                    inspected.append(str(candidate))
+                    continue
+                inspected.append(str(candidate))
+                matches = list(candidate.glob(pattern))
+                if matches:
+                    selected_dir = candidate
+                    json_files = matches
+                    break
+
+            if not json_files:
+                self.logger.warning(
+                    "No recommendation outputs matching %s were found in %s",
+                    pattern,
+                    inspected,
+                )
+                return result_dict
+
+            most_recent_json = max(json_files, key=lambda p: p.stat().st_mtime)
+            result_dict['output_files']['json'] = str(most_recent_json)
+            for ext in ('.csv', '.parquet'):
+                candidate = most_recent_json.with_suffix(ext)
+                if candidate.exists():
+                    result_dict['output_files'][ext.lstrip('.')] = str(candidate)
+
+            try:
+                with open(most_recent_json, 'r') as f:
+                    data = json.load(f)
+                    recs = data.get('recommendations', {}) or {}
+                    visitor_count = len(recs)
+                    result_dict['statistics'].setdefault('total_rows', visitor_count)
+                    result_dict['statistics'].setdefault('unique_visitors', visitor_count)
+            except Exception as e:
+                self.logger.debug(f"Could not enrich statistics from JSON: {e}")
 
             self.logger.info(f"Recommendation processing completed: {result_dict['statistics']}")
             return result_dict
