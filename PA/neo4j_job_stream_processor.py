@@ -18,6 +18,7 @@ import json
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 import inspect
+from typing import Dict
 
 from utils.neo4j_utils import resolve_neo4j_credentials
 
@@ -64,6 +65,8 @@ class Neo4jJobStreamProcessor:
         self.node_labels = self.neo4j_config.get("node_labels", {})
         self.relationships = self.neo4j_config.get("relationships", {})
         self.job_stream_mapping_config = self.neo4j_config.get("job_stream_mapping", {})
+        self.session_output_config = config.get("session_output_files", {})
+        self.stream_processing_config = config.get("stream_processing", {})
         
         # NEW: Check if job stream processing is enabled for this show
         self.job_stream_enabled = self.job_stream_mapping_config.get("enabled", True)
@@ -79,6 +82,15 @@ class Neo4jJobStreamProcessor:
         # Get mapping file from config
         self.job_stream_mapping_file = self.job_stream_mapping_config.get("file", "job_to_stream.csv")
 
+        # Load valid stream catalog entries for filtering warnings
+        self.stream_catalog_lookup = self._load_stream_catalog_lookup()
+        self.has_stream_catalog = bool(self.stream_catalog_lookup)
+        if not self.has_stream_catalog:
+            self.logger.warning(
+                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - "
+                "Stream catalog lookup is empty; job-to-stream mapping will fall back to legacy behavior"
+            )
+
         # Initialize statistics
         self.statistics = {
             "relationships_created": 0,
@@ -90,6 +102,7 @@ class Neo4jJobStreamProcessor:
             "stream_matches_found": 0,
             "initial_relationship_count": 0,
             "final_relationship_count": 0,
+            "streams_missing_from_catalog": 0,
             "processing_skipped": False,
             "skip_reason": None
         }
@@ -184,6 +197,77 @@ class Neo4jJobStreamProcessor:
             )
             raise
 
+    def _build_stream_catalog_candidate_paths(self):
+        streams_filename = self.session_output_config.get("streams_catalog", "streams.json")
+        output_root = os.path.join(self.input_dir, "output")
+        use_enhanced = self.stream_processing_config.get("use_enhanced_streams_catalog", False)
+        use_cached = self.stream_processing_config.get("use_cached_descriptions", False)
+
+        candidates = []
+        if use_cached:
+            candidates.append(os.path.join(output_root, "streams_cache.json"))
+
+        if use_enhanced:
+            base, ext = os.path.splitext(streams_filename)
+            enhanced_name = f"{base}_enhanced{ext}" if ext else f"{streams_filename}_enhanced"
+            candidates.append(os.path.join(output_root, enhanced_name))
+            candidates.append(os.path.join(output_root, "streams_enhanced.json"))
+
+        candidates.append(os.path.join(output_root, streams_filename))
+        candidates.append(os.path.join(output_root, "streams.json"))
+        return candidates
+
+    def _load_stream_catalog_lookup(self) -> Dict[str, str]:
+        lookup: Dict[str, str] = {}
+        candidates = self._build_stream_catalog_candidate_paths()
+        seen_paths = set()
+
+        for path in candidates:
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            if not os.path.exists(path):
+                continue
+
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+
+                if not isinstance(data, dict):
+                    self.logger.warning(
+                        f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Stream catalog at {path} is not a dictionary"
+                    )
+                    continue
+
+                added = 0
+                for name in data.keys():
+                    if not isinstance(name, str):
+                        continue
+                    key = name.strip().lower()
+                    if key and key not in lookup:
+                        lookup[key] = name.strip()
+                        added += 1
+
+                self.logger.info(
+                    f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Loaded {added} stream definitions from {path}"
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Failed to load stream catalog at {path}: {exc}"
+                )
+
+        if lookup:
+            self.logger.info(
+                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Prepared stream catalog lookup with {len(lookup)} entries"
+            )
+        return lookup
+
+    def _resolve_stream_name_from_catalog(self, stream_name: str) -> str:
+        if not stream_name:
+            return None
+        key = stream_name.strip().lower()
+        return self.stream_catalog_lookup.get(key)
+
     def _normalize_stream_name(self, stream_name):
         """
         Apply normalization rules to stream names.
@@ -276,6 +360,7 @@ class Neo4jJobStreamProcessor:
                 "visitor_nodes_processed": 0,
                 "job_roles_processed": 0,
                 "stream_matches_found": 0,
+                "streams_missing_from_catalog": 0,
             }
 
             # Get all unique job roles from the database that match our mapping
@@ -325,7 +410,14 @@ class Neo4jJobStreamProcessor:
                                 f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Applied stream mapping: '{stream_name}' → '{normalized_stream_name}'"
                             )
 
-                        mapped_streams.append(normalized_stream_name)
+                        if self.has_stream_catalog:
+                            catalog_stream_name = self._resolve_stream_name_from_catalog(normalized_stream_name)
+                            if not catalog_stream_name:
+                                batch_stats["streams_missing_from_catalog"] += 1
+                                continue
+                            mapped_streams.append(catalog_stream_name)
+                        else:
+                            mapped_streams.append(normalized_stream_name)
 
                 # Get unique streams after mapping and normalization
                 applicable_streams = list(set(mapped_streams))
@@ -491,6 +583,11 @@ class Neo4jJobStreamProcessor:
                     f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Processed {self.statistics['visitor_nodes_processed']} visitor nodes with {self.statistics['job_roles_processed']} matching job roles"
                 )
 
+                if self.statistics["streams_missing_from_catalog"] > 0:
+                    self.logger.info(
+                        f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Skipped {self.statistics['streams_missing_from_catalog']} stream mappings not present in catalog"
+                    )
+
                 if self.statistics["stream_mappings_applied"] > 0:
                     self.logger.info(
                         f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Stream name mappings applied: {self.statistics['stream_mappings_applied']}"
@@ -531,6 +628,11 @@ class Neo4jJobStreamProcessor:
         if self.statistics["stream_mappings_applied"] > 0:
             self.logger.info(
                 f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Stream name mappings applied: {self.statistics['stream_mappings_applied']}"
+            )
+
+        if self.statistics["streams_missing_from_catalog"] > 0:
+            self.logger.info(
+                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Stream mappings skipped (missing in catalog): {self.statistics['streams_missing_from_catalog']}"
             )
 
         # Check for discrepancies

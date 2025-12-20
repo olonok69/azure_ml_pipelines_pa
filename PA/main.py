@@ -14,6 +14,7 @@ from utils.logging_utils import setup_logging
 from utils.config_utils import load_config
 from utils.summary_utils import generate_and_save_summary
 from utils.mlflow_utils import MLflowManager
+from utils.app_insights import configure_app_insights
 from pipeline import (
     run_registration_processing,
     run_scan_processing,
@@ -165,7 +166,13 @@ def log_neo4j_step_metrics(mlflow_manager, processors, step_number):
 def main():
     """Main entry point for the pipeline with simplified MLflow integration."""
     
-    load_dotenv("keys/.env")
+    # Load telemetry/env settings from both workspace notebooks and legacy keys directory
+    for env_file in (os.path.join("notebooks", ".env"), os.path.join("keys", ".env")):
+        if os.path.exists(env_file):
+            load_dotenv(env_file, override=False)
+
+    # Mirror Azure ML step telemetry wiring so local CLI runs emit to App Insights
+    configure_app_insights(service_name="pa_main_cli")
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Process and upload data to Neo4j with MLflow tracking.")
     parser.add_argument(

@@ -5,6 +5,7 @@ import pandas as pd
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 import inspect
+from typing import Dict
 
 from utils.neo4j_utils import resolve_neo4j_credentials
 
@@ -51,6 +52,8 @@ class Neo4jSpecializationStreamProcessor:
         self.specialization_stream_mapping_config = neo4j_config.get(
             "specialization_stream_mapping", {}
         )
+        self.session_output_config = config.get("session_output_files", {})
+        self.stream_processing_config = config.get("stream_processing", {})
 
         # Check if specialization stream processing is enabled for this show
         self.specialization_stream_enabled = self.specialization_stream_mapping_config.get("enabled", True)
@@ -105,6 +108,14 @@ class Neo4jSpecializationStreamProcessor:
             "progress_log_interval", 10000
         )
 
+        # Load stream catalog lookup for warning suppression
+        self.stream_catalog_lookup = self._load_stream_catalog_lookup()
+        self.has_stream_catalog = bool(self.stream_catalog_lookup)
+        if not self.has_stream_catalog:
+            self.logger.warning(
+                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Stream catalog lookup is empty; specialization mappings will fall back to legacy behavior"
+            )
+
         # Initialize statistics
         self.statistics = {
             "initial_count": 0,
@@ -121,6 +132,7 @@ class Neo4jSpecializationStreamProcessor:
             "relationships_created": 0,
             "relationships_skipped": 0,
             "relationships_not_found": 0,
+            "streams_missing_from_catalog": 0,
             "processing_skipped": False,
             "skip_reason": None
         }
@@ -276,6 +288,77 @@ class Neo4jSpecializationStreamProcessor:
         # Default: return original (trimmed) without change
         return original.strip(), False
 
+    def _build_stream_catalog_candidate_paths(self):
+        streams_filename = self.session_output_config.get("streams_catalog", "streams.json")
+        output_root = os.path.join(self.output_dir, "output")
+        use_enhanced = self.stream_processing_config.get("use_enhanced_streams_catalog", False)
+        use_cached = self.stream_processing_config.get("use_cached_descriptions", False)
+
+        candidates = []
+        if use_cached:
+            candidates.append(os.path.join(output_root, "streams_cache.json"))
+
+        if use_enhanced:
+            base, ext = os.path.splitext(streams_filename)
+            enhanced_name = f"{base}_enhanced{ext}" if ext else f"{streams_filename}_enhanced"
+            candidates.append(os.path.join(output_root, enhanced_name))
+            candidates.append(os.path.join(output_root, "streams_enhanced.json"))
+
+        candidates.append(os.path.join(output_root, streams_filename))
+        candidates.append(os.path.join(output_root, "streams.json"))
+        return candidates
+
+    def _load_stream_catalog_lookup(self) -> Dict[str, str]:
+        lookup: Dict[str, str] = {}
+        candidates = self._build_stream_catalog_candidate_paths()
+        seen_paths = set()
+
+        for path in candidates:
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            if not os.path.exists(path):
+                continue
+
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+
+                if not isinstance(data, dict):
+                    self.logger.warning(
+                        f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Stream catalog at {path} is not a dictionary"
+                    )
+                    continue
+
+                added = 0
+                for name in data.keys():
+                    if not isinstance(name, str):
+                        continue
+                    key = name.strip().lower()
+                    if key and key not in lookup:
+                        lookup[key] = name.strip()
+                        added += 1
+
+                self.logger.info(
+                    f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Loaded {added} stream definitions from {path}"
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Failed to load stream catalog at {path}: {exc}"
+                )
+
+        if lookup:
+            self.logger.info(
+                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Prepared stream catalog lookup with {len(lookup)} entries"
+            )
+        return lookup
+
+    def _resolve_stream_name_from_catalog(self, stream_name: str) -> str:
+        if not stream_name:
+            return None
+        key = stream_name.strip().lower()
+        return self.stream_catalog_lookup.get(key)
+
     def process_visitor_specializations(
         self, tx, node_label, specialization_field, map_specialization, specialization_stream_mapping, create_only_new
     ):
@@ -291,6 +374,7 @@ class Neo4jSpecializationStreamProcessor:
             "relationships_created": 0,
             "relationships_skipped": 0,
             "relationships_not_found": 0,
+            "streams_missing_from_catalog": 0,
         }
 
         # Build query with show filtering if configured
@@ -374,6 +458,15 @@ class Neo4jSpecializationStreamProcessor:
                             #         f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Stream name normalization: '{stream_name}' → '{normalized_stream_name}'"
                             #     )
 
+                            if self.has_stream_catalog:
+                                catalog_stream_name = self._resolve_stream_name_from_catalog(normalized_stream_name)
+                                if not catalog_stream_name:
+                                    stats["streams_missing_from_catalog"] += 1
+                                    continue
+                                target_stream_name = catalog_stream_name
+                            else:
+                                target_stream_name = normalized_stream_name
+
                             stream_query = f"""
                             MATCH (s:{self.stream_label})
                             WHERE LOWER(s.stream) = LOWER($stream_name){stream_search_filter}
@@ -381,7 +474,7 @@ class Neo4jSpecializationStreamProcessor:
                             LIMIT 1
                             """
 
-                            stream_params = {"stream_name": normalized_stream_name}
+                            stream_params = {"stream_name": target_stream_name}
                             if self.show_name:
                                 stream_params["show_name"] = self.show_name
 
@@ -550,6 +643,9 @@ class Neo4jSpecializationStreamProcessor:
                     self.statistics["relationships_not_found"] += visitor_stats[
                         "relationships_not_found"
                     ]
+                    self.statistics["streams_missing_from_catalog"] += visitor_stats[
+                        "streams_missing_from_catalog"
+                    ]
 
                     self.logger.info(
                         f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Processed {node_label}: "
@@ -626,6 +722,11 @@ class Neo4jSpecializationStreamProcessor:
         self.logger.info(
             f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Stream matches found: {self.statistics['stream_matches_found']}"
         )
+
+        if self.statistics["streams_missing_from_catalog"] > 0:
+            self.logger.info(
+                f"{inspect.currentframe().f_code.co_name}:{inspect.currentframe().f_lineno} - Stream mappings skipped (missing in catalog): {self.statistics['streams_missing_from_catalog']}"
+            )
 
         if self.statistics["relationships_not_found"] > 0:
             self.logger.warning(
