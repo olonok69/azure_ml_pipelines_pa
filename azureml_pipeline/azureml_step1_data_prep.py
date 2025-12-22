@@ -761,8 +761,7 @@ class DataPreparationStep:
         self._append_output_file(session_bucket, standard_output_dir, streams_catalog,
                                  dest_name=os.path.basename(streams_catalog) if streams_catalog else None)
 
-        # Legacy fallback files that may not be explicitly declared in config
-        self._append_output_file(session_bucket, standard_output_dir, 'streams.csv', dest_name='streams.csv')
+        # Legacy fallback for cached streams to assist downstream processors
         self._append_output_file(session_bucket, standard_output_dir, 'streams_cache.json', dest_name='streams_cache.json')
 
         neo4j_support_files = self._get_neo4j_support_files()
@@ -906,12 +905,23 @@ class DataPreparationStep:
                 output_dir = self.config.get('output_dir', 'output')
                 output_files: List[str] = []
                 
-                expected_files = [
-                    'sessions_visited_last_bva.csv',
-                    'sessions_visited_last_lva.csv',
-                    'scan_lva_past',
-                    'scan_bva_past'
-                ]
+                expected_files: List[str] = []
+                scan_outputs = (self.config.get('scan_output_files', {}) or {})
+                processed_scans = scan_outputs.get('processed_scans') or scan_outputs.get('scan_data') or {}
+                sessions_visited = scan_outputs.get('sessions_visited') or {}
+
+                for key in ('last_year_main', 'last_year_secondary', 'this_year', 'this_year_post'):
+                    filename = processed_scans.get(key)
+                    if filename:
+                        expected_files.append(filename)
+
+                for key in ('main_event', 'secondary_event', 'this_year_post'):
+                    filename = sessions_visited.get(key)
+                    if filename:
+                        expected_files.append(filename)
+
+                # Ensure we do not look for duplicates
+                expected_files = list({name for name in expected_files if name})
                 
                 for filename in expected_files:
                     filepath = os.path.join(output_dir, filename)

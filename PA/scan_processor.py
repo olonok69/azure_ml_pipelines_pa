@@ -34,20 +34,30 @@ class ScanProcessor:
         self.seminars_scans_this_year_enhanced = pd.DataFrame()
         
         # Get output file configurations with backward compatibility
-        self.output_files = config.get("scan_output_files", {})
-        
-        # Backward compatibility: if scan_output_files section doesn't exist, use default names
-        if not self.output_files:
-            self.output_files = {
-                "scan_data": {
-                    "main_event": "scan_bva_past.csv",
-                    "secondary_event": "scan_lva_past.csv"
-                },
-                "sessions_visited": {
-                    "main_event": "sessions_visited_last_bva.csv",
-                    "secondary_event": "sessions_visited_last_lva.csv"
-                }
-            }
+        self.output_files = config.get("scan_output_files", {}) or {}
+
+        # Ensure modern blocks exist with sensible defaults so file naming is predictable
+        processed_scans_cfg = self.output_files.setdefault("processed_scans", {})
+        legacy_scan_cfg = self.output_files.get("scan_data", {}) or {}
+        sessions_cfg = self.output_files.setdefault("sessions_visited", {})
+
+        processed_defaults = {
+            "last_year_main": legacy_scan_cfg.get("main_event", "scan_bva_past.csv"),
+            "last_year_secondary": legacy_scan_cfg.get("secondary_event", "scan_lva_past.csv"),
+            "this_year_post": legacy_scan_cfg.get("this_year_post", "scan_this_post.csv"),
+        }
+
+        for key, value in processed_defaults.items():
+            processed_scans_cfg.setdefault(key, value)
+
+        session_defaults = {
+            "main_event": "sessions_visited_last_bva.csv",
+            "secondary_event": "sessions_visited_last_lva.csv",
+            "this_year_post": "sessions_visited_this_year.csv",
+        }
+
+        for key, value in session_defaults.items():
+            sessions_cfg.setdefault(key, value)
 
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
@@ -462,55 +472,67 @@ class ScanProcessor:
     def save_processed_data(self) -> None:
         """Save all processed data to CSV files."""
         try:
-            # Get output file names from config with fallback to default names
+            processed_scans_config = self.output_files.get("processed_scans", {})
             scan_data_config = self.output_files.get("scan_data", {})
             sessions_visited_config = self.output_files.get("sessions_visited", {})
-            
-            # Save enhanced seminar scan data
-            main_scan_output_path = os.path.join(
-                self.output_dir, "output", 
-                scan_data_config.get("main_event", "scan_bva_past.csv")
-            )
-            secondary_scan_output_path = os.path.join(
-                self.output_dir, "output", 
-                scan_data_config.get("secondary_event", "scan_lva_past.csv")
-            )
+
+            def _resolve_scan_filename(primary_key: str, legacy_key: str, default_name: str) -> str:
+                if processed_scans_config.get(primary_key):
+                    return processed_scans_config[primary_key]
+                if scan_data_config.get(legacy_key):
+                    return scan_data_config[legacy_key]
+                return default_name
+
+            main_scan_filename = _resolve_scan_filename("last_year_main", "main_event", "scan_bva_past.csv")
+            secondary_scan_filename = _resolve_scan_filename("last_year_secondary", "secondary_event", "scan_lva_past.csv")
+            this_year_post_filename = _resolve_scan_filename("this_year_post", "this_year_post", "scan_this_post.csv")
+            this_year_filename = processed_scans_config.get("this_year")
+
+            main_scan_output_path = os.path.join(self.output_dir, "output", main_scan_filename)
+            secondary_scan_output_path = os.path.join(self.output_dir, "output", secondary_scan_filename)
 
             # Save enhanced seminar data with demographics
             main_sessions_output_path = os.path.join(
-                self.output_dir, "output", 
+                self.output_dir, "output",
                 sessions_visited_config.get("main_event", "sessions_visited_last_bva.csv")
             )
             secondary_sessions_output_path = os.path.join(
-                self.output_dir, "output", 
+                self.output_dir, "output",
                 sessions_visited_config.get("secondary_event", "sessions_visited_last_lva.csv")
             )
 
-            # Save the data
-            self.seminars_scans_past_enhanced_main.to_csv(
-                main_scan_output_path, index=False
-            )
-            self.seminars_scans_past_enhanced_secondary.to_csv(
-                secondary_scan_output_path, index=False
-            )
+            self.seminars_scans_past_enhanced_main.to_csv(main_scan_output_path, index=False)
+            self.seminars_scans_past_enhanced_secondary.to_csv(secondary_scan_output_path, index=False)
             self.enhanced_seminars_df_main.to_csv(main_sessions_output_path, index=False)
             self.enhanced_seminars_df_secondary.to_csv(secondary_sessions_output_path, index=False)
+
+            if this_year_filename and not self.seminars_scans_this_year_enhanced.empty:
+                this_year_scan_path = os.path.join(self.output_dir, "output", this_year_filename)
+                self.seminars_scans_this_year_enhanced.to_csv(this_year_scan_path, index=False)
+                self.logger.info(
+                    "Saved current-year processed scans to %s", this_year_filename
+                )
+            elif this_year_filename:
+                self.logger.warning(
+                    "Configured processed_scans.this_year='%s' but no current-year scan data was loaded",
+                    this_year_filename,
+                )
 
             if self.mode == "post_analysis" and not self.seminars_scans_this_year_enhanced.empty:
                 this_year_scan_output_path = os.path.join(
                     self.output_dir,
                     "output",
-                    scan_data_config.get("this_year_post", "scan_this_post.csv")
+                    this_year_post_filename,
                 )
                 this_year_sessions_output_path = os.path.join(
                     self.output_dir,
                     "output",
-                    sessions_visited_config.get("this_year_post", "sessions_visited_this_year.csv")
+                    sessions_visited_config.get("this_year_post", "sessions_visited_this_year.csv"),
                 )
 
                 this_year_enhanced = self.add_demographics_to_seminars(
                     self.df_reg_wdemo_this_year,
-                    self.seminars_scans_this_year_enhanced
+                    self.seminars_scans_this_year_enhanced,
                 ) if not self.df_reg_wdemo_this_year.empty else self.seminars_scans_this_year_enhanced.copy()
 
                 # Ensure key_text column exists for downstream matching
