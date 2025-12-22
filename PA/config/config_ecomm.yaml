@@ -157,10 +157,9 @@ stream_processing:
 # Scan output files
 scan_output_files:
   processed_scans:
-    this_year: "scan_this_filtered_valid_cols.csv"
-    last_year_main: "scan_last_filtered_valid_cols_bva.csv"
-    last_year_secondary: "scan_last_filtered_valid_cols_lva.csv"
-    this_year_post: "scan_this_year_post.csv"
+    last_year_main: "scan_bva_past.csv"
+    last_year_secondary: "scan_lva_past.csv"
+    this_year_post: "scan_this_post.csv"
   sessions_visited:
     main_event: "sessions_visited_last_bva.csv"
     secondary_event: "sessions_visited_last_lva.csv"
