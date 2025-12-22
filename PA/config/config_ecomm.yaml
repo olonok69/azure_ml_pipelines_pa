@@ -1,6 +1,6 @@
 # Event-specific configuration for ECOMM events
 # This configuration file contains all event-specific settings and output file names
-mode: "post_analysis"  # can be engagement | personal_agendas | post_analysis
+mode: "personal_agendas"  # can be engagement | personal_agendas | post_analysis
 # Documentation assets surfaced by the application
 documentation:
   generic_pipeline_map: "docs/generic_pipeline_map.svg"
@@ -106,7 +106,7 @@ output_files:
     filename_pattern: "visitor_recommendations_{timestamp}"  # Pattern for output files
     save_csv: true
 # Pipeline control settings (SAME AS VET)
-create_only_new: true  # If true, only process new visitors without recommendations
+create_only_new: false  # If true, only process new visitors without recommendations for Personal Agendas true
 
 # Pipeline step activation settings - UPDATED FOR NEO4J SESSION PROCESSING
 pipeline_steps:
@@ -117,8 +117,8 @@ pipeline_steps:
   # Neo4j processing steps
   neo4j_visitor_processing: true
   neo4j_session_processing: true  # ENABLED: Added Neo4j session processing
-  neo4j_job_stream_processing: true  # ENABLED but will be skipped via config
-  neo4j_specialization_stream_processing: true  # ENABLED but will be skipped via config
+  neo4j_job_stream_processing: false  # Disable job→stream enrichment for ECOMM
+  neo4j_specialization_stream_processing: false  # Disable specialization→stream enrichment for ECOMM
   neo4j_visitor_relationship_processing: true
   session_embedding_processing: true
   session_recommendation_processing: true  # Enable session recommendation processing
@@ -212,14 +212,22 @@ recommendation:
   similar_visitors_count: 3       # Number of similar visitors to consider for new visitors
   resolve_overlapping_sessions_by_similarity: true 
   control_group:                  # Control-group defaults (only active in personal_agendas mode)
-    enabled: false
+    enabled: true
     percentage: 5                 # Expressed as percent (5 => 5%)
     random_seed: 42
     file_suffix: "_control"
     output_directory: "recommendations/control"
     neo4j_property: "control_group"
+  returning_without_history:
+    enabled: true
+    similarity_exponent: 1.5
   use_langchain: false            # Whether to use LangChain for filtering
   enable_filtering: false         # Disable filtering for ECOMM shows
+  theatre_capacity_limits:
+    enabled: false
+    capacity_file: "data/ecomm/theatre_capacity.csv"
+    session_file: "data/ecomm/ECE25_session_export.csv"
+    capacity_multiplier: 1.0
   # Additional visitor fields to include directly in exported recommendations CSV (enrichment)
   export_additional_visitor_fields:
     - Email
@@ -250,7 +258,7 @@ recommendation:
 
 # Neo4j configuration (SAME STRUCTURE - different database)
 neo4j:
-  environment: "prod"
+  environment: "test"
   show_name: "ecomm"  # ADDED: Show attribute for ECOMM nodes
   node_labels:
     visitor_this_year: "Visitor_this_year"

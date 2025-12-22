@@ -496,31 +496,43 @@ class RecommendationsStep:
             pattern = f"visitor_recommendations_{show_name}_*.json"
 
             configured_root = Path(getattr(processor, 'output_dir', Path(root_dir) / 'data'))
+            control_output_dir_cfg = getattr(processor, 'control_group_output_directory', None)
             candidate_dirs: List[Path] = [
                 configured_root / 'recommendations',
                 configured_root,
                 Path(root_dir) / 'data' / 'output' / 'recommendations',
             ]
 
-            selected_dir: Optional[Path] = None
-            json_files: List[Path] = []
+            if control_output_dir_cfg:
+                control_path = Path(control_output_dir_cfg)
+                if not control_path.is_absolute():
+                    control_path = configured_root / control_path
+                candidate_dirs.append(control_path)
+
+            primary_json_files: List[Path] = []
+            control_json_files: List[Path] = []
             inspected: List[str] = []
 
             for candidate in candidate_dirs:
                 if not candidate:
                     continue
                 candidate = candidate.resolve()
-                if not candidate.exists():
-                    inspected.append(str(candidate))
-                    continue
                 inspected.append(str(candidate))
-                matches = list(candidate.glob(pattern))
-                if matches:
-                    selected_dir = candidate
-                    json_files = matches
-                    break
+                if not candidate.exists():
+                    continue
 
-            if not json_files:
+                matches = list(candidate.rglob(pattern))
+                if not matches:
+                    continue
+
+                for match in matches:
+                    match = match.resolve()
+                    if match.stem.endswith('_control'):
+                        control_json_files.append(match)
+                    else:
+                        primary_json_files.append(match)
+
+            if not primary_json_files:
                 self.logger.warning(
                     "No recommendation outputs matching %s were found in %s",
                     pattern,
@@ -528,12 +540,38 @@ class RecommendationsStep:
                 )
                 return result_dict
 
-            most_recent_json = max(json_files, key=lambda p: p.stat().st_mtime)
+            most_recent_json = max(primary_json_files, key=lambda p: p.stat().st_mtime)
             result_dict['output_files']['json'] = str(most_recent_json)
             for ext in ('.csv', '.parquet'):
                 candidate = most_recent_json.with_suffix(ext)
                 if candidate.exists():
                     result_dict['output_files'][ext.lstrip('.')] = str(candidate)
+
+            base_prefix = f"visitor_recommendations_{show_name}_"
+            base_timestamp = None
+            if most_recent_json.stem.startswith(base_prefix):
+                base_timestamp = most_recent_json.stem[len(base_prefix):]
+
+            control_json_path: Optional[Path] = None
+            if base_timestamp and control_json_files:
+                expected_stem = f"{base_prefix}{base_timestamp}_control"
+                for ctrl_file in control_json_files:
+                    if ctrl_file.stem == expected_stem:
+                        control_json_path = ctrl_file
+                        break
+
+            if control_json_path:
+                result_dict['output_files']['control_json'] = str(control_json_path)
+                for ext in ('.csv', '.parquet'):
+                    candidate = control_json_path.with_suffix(ext)
+                    if candidate.exists():
+                        result_dict['output_files'][f"control_{ext.lstrip('.')}"] = str(candidate)
+            elif self.config.get('recommendation', {}).get('control_group', {}).get('enabled'):
+                self.logger.warning(
+                    "Control group outputs expected but not found for timestamp %s (searched: %s)",
+                    base_timestamp,
+                    inspected,
+                )
 
             try:
                 with open(most_recent_json, 'r') as f:
@@ -874,7 +912,7 @@ def main(args):
     }
 
     if any(payload_inputs.values()):
-        data_dir = os.path.join(root_dir, 'data')
+        data_dir = os.path.join(project_root, 'data')
         stage_step1_outputs(step.config, payload_inputs, data_dir, step.logger)
     
     # Run processing
