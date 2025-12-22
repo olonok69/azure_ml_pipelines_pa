@@ -774,10 +774,15 @@ class DataPreparationStep:
             _append_support_file(value, f"session_files.{key}")
 
         theatre_limits_cfg = (self.config.get('recommendation', {}) or {}).get('theatre_capacity_limits', {}) or {}
-        for field_name in ('capacity_file', 'session_file'):
-            _append_support_file(
-                theatre_limits_cfg.get(field_name),
-                f"recommendation.theatre_capacity_limits.{field_name}"
+        if theatre_limits_cfg.get('enabled', True):
+            for field_name in ('capacity_file', 'session_file'):
+                _append_support_file(
+                    theatre_limits_cfg.get(field_name),
+                    f"recommendation.theatre_capacity_limits.{field_name}"
+                )
+        else:
+            self.logger.info(
+                "Theatre capacity enforcement disabled; skipping capacity/session support files"
             )
 
         # Remove empty mappings to avoid unnecessary copy attempts

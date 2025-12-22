@@ -90,6 +90,7 @@ class RecommendationsStep:
         scan_data_path: Optional[str] = None,
         input_data_uri: Optional[str] = None,
         use_keyvault: bool = True,
+        neo4j_environment: Optional[str] = None,
     ):
         """
         Initialize the Recommendations Step.
@@ -112,9 +113,11 @@ class RecommendationsStep:
         self.scan_data_path = Path(scan_data_path) if scan_data_path else None
         self.input_data_uri = input_data_uri
         self.logger = self._setup_logging()
+        self.neo4j_environment_override = neo4j_environment
 
         # Load config early
         self.config = self._load_configuration(config_path)
+        self.selected_neo4j_environment = self._apply_environment_override()
         self.create_only_new = self.incremental
 
         if any([self.session_data_path, self.registration_data_path, self.scan_data_path]):
@@ -145,6 +148,7 @@ class RecommendationsStep:
                     neo4j_username,
                     neo4j_password,
                     logger=self.logger,
+                    environment_override=self.selected_neo4j_environment,
                 )
                 self.logger.info("Neo4j credentials found in environment variables")
                 return {
@@ -176,6 +180,7 @@ class RecommendationsStep:
                         neo4j_username,
                         neo4j_password,
                         logger=self.logger,
+                        environment_override=self.selected_neo4j_environment,
                         env_path=env_path,
                     )
                     return {
@@ -191,6 +196,20 @@ class RecommendationsStep:
             self.logger.info("Falling back to environment variables")
         
         return {}
+
+    def _apply_environment_override(self) -> Optional[str]:
+        """Ensure the configuration reflects the prioritized Neo4j environment."""
+        config_env = (self.config.get('neo4j', {}) or {}).get('environment')
+        selected = self.neo4j_environment_override or config_env
+
+        if selected:
+            normalized = str(selected).strip()
+            self.config.setdefault('neo4j', {})['environment'] = normalized
+            self.logger.info("Using Neo4j environment '%s'", normalized)
+            return normalized
+
+        self.logger.info("Neo4j environment not specified; default selection will be used")
+        return None
     
     def _ensure_neo4j_credentials(self):
         """Ensure Neo4j credentials are available from environment or Key Vault."""
@@ -903,6 +922,7 @@ def main(args):
         registration_data_path=args.input_registration,
         scan_data_path=args.input_scan,
         input_data_uri=args.input_data_uri,
+        neo4j_environment=args.neo4j_environment,
     )
 
     payload_inputs = {
@@ -941,6 +961,8 @@ def main(args):
     print("\n" + "=" * 60)
     print("RECOMMENDATIONS STEP SUMMARY")
     print("=" * 60)
+    if args.neo4j_environment:
+        print(f"Neo4j environment override: {args.neo4j_environment}")
     print(f"Configuration: {args.config}")
     print(f"Incremental: {args.incremental}")
 
@@ -1003,6 +1025,12 @@ def parse_args():
         default=False,
         type=_bool_arg,
         help="Run incremental processing (accepts true/false)"
+    )
+
+    parser.add_argument(
+        "--neo4j_environment",
+        type=str,
+        help="Override Neo4j environment (dev|test|prod)"
     )
     
     parser.add_argument(

@@ -89,6 +89,15 @@ class KeyVaultManager:
             "mlflow-registry-uri",
             "mlflow-experiment-id"
         ]
+
+        # Collect environment-specific Neo4j secrets when available
+        for suffix in ("dev", "test", "prod"):
+            secret_names.extend(
+                [
+                    f"neo4j-uri-{suffix}",
+                    f"neo4j-password-{suffix}",
+                ]
+            )
         
         secrets = {}
         for name in secret_names:

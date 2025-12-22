@@ -52,35 +52,57 @@ def apply_neo4j_credentials(
     password: Optional[str],
     logger: Optional[Any] = None,
     env_path: Optional[str] = None,
+    environment_override: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Set Neo4j credentials in env vars and persist them to the shared .env file."""
 
     config = config or {}
     neo4j_config = config.get("neo4j", {}) or {}
-    env_lower, env_key = determine_environment_key(
-        neo4j_config.get("environment"), logger=logger
+
+    requested_environment = environment_override or neo4j_config.get("environment")
+    env_lower, env_key = determine_environment_key(requested_environment, logger=logger)
+    neo4j_config["environment"] = env_lower
+    config["neo4j"] = neo4j_config
+
+    env_specific_uri = os.environ.get(f"NEO4J_URI_{env_key}")
+    env_specific_password = os.environ.get(f"NEO4J_PASSWORD_{env_key}")
+
+    resolved_uri = (uri or env_specific_uri or neo4j_config.get("uri") or os.environ.get("NEO4J_URI"))
+    resolved_username = (
+        username
+        or neo4j_config.get("username")
+        or os.environ.get("NEO4J_USERNAME")
+        or "neo4j"
+    )
+    resolved_password = (
+        password
+        or env_specific_password
+        or neo4j_config.get("password")
+        or os.environ.get("NEO4J_PASSWORD")
     )
 
-    updates: Dict[str, Optional[str]] = {}
+    if not resolved_uri or not resolved_password:
+        raise ValueError(
+            f"Missing Neo4j credentials for environment '{env_lower}'. "
+            "Ensure NEO4J_URI/NEO4J_PASSWORD (or their environment-specific variants) are defined."
+        )
 
-    if uri:
-        clean_uri = uri.strip()
-        os.environ["NEO4J_URI"] = clean_uri
-        os.environ[f"NEO4J_URI_{env_key}"] = clean_uri
-        updates["NEO4J_URI"] = clean_uri
-        updates[f"NEO4J_URI_{env_key}"] = clean_uri
+    clean_uri = resolved_uri.strip()
+    clean_username = resolved_username.strip()
+    clean_password = resolved_password.strip()
 
-    if username:
-        clean_username = username.strip()
-        os.environ["NEO4J_USERNAME"] = clean_username
-        updates["NEO4J_USERNAME"] = clean_username
+    updates: Dict[str, Optional[str]] = {
+        "NEO4J_URI": clean_uri,
+        f"NEO4J_URI_{env_key}": clean_uri,
+        "NEO4J_USERNAME": clean_username,
+        "NEO4J_PASSWORD": clean_password,
+        f"NEO4J_PASSWORD_{env_key}": clean_password,
+        "NEO4J_ENVIRONMENT_RESOLVED": env_lower,
+    }
 
-    if password:
-        clean_password = password.strip()
-        os.environ["NEO4J_PASSWORD"] = clean_password
-        os.environ[f"NEO4J_PASSWORD_{env_key}"] = clean_password
-        updates["NEO4J_PASSWORD"] = clean_password
-        updates[f"NEO4J_PASSWORD_{env_key}"] = clean_password
+    for key, value in updates.items():
+        if value is not None:
+            os.environ[key] = value
 
     if updates:
         update_env_file(updates, logger=logger, env_path=env_path)

@@ -52,7 +52,13 @@ from step_input_sync import stage_step1_outputs
 class Neo4jPreparationStep:
     """Azure ML Neo4j Preparation Step for Personal Agendas pipeline."""
     
-    def __init__(self, config_path: str, incremental: bool = False, use_keyvault: bool = True):
+    def __init__(
+        self,
+        config_path: str,
+        incremental: bool = False,
+        use_keyvault: bool = True,
+        neo4j_environment: Optional[str] = None,
+    ):
         """
         Initialize the Neo4j Preparation Step.
         
@@ -64,9 +70,11 @@ class Neo4jPreparationStep:
         self.config_path = config_path
         self.incremental = incremental
         self.use_keyvault = use_keyvault
+        self.neo4j_environment_override = neo4j_environment
         self.logger = self._setup_logging()
         
         self.config = self._load_configuration(config_path)
+        self.selected_neo4j_environment = self._apply_environment_override()
 
         # Load secrets from Key Vault if in Azure ML
         if self.use_keyvault and self._is_azure_ml_environment():
@@ -102,6 +110,7 @@ class Neo4jPreparationStep:
                     neo4j_username,
                     neo4j_password,
                     logger=self.logger,
+                    environment_override=self.selected_neo4j_environment,
                 )
                 return
 
@@ -131,12 +140,27 @@ class Neo4jPreparationStep:
                 os.environ.get("NEO4J_USERNAME"),
                 os.environ.get("NEO4J_PASSWORD"),
                 logger=self.logger,
+                environment_override=self.selected_neo4j_environment,
             )
             
         except Exception as e:
             self.logger.error(f"Error in Key Vault setup: {e}")
             self.logger.info("Neo4j credentials must be provided via environment variables or .env file")
     
+    def _apply_environment_override(self) -> Optional[str]:
+        """Ensure the config reflects the highest-precedence Neo4j environment."""
+        config_env = (self.config.get('neo4j', {}) or {}).get('environment')
+        selected = self.neo4j_environment_override or config_env
+
+        if selected:
+            normalized = str(selected).strip()
+            self.config.setdefault('neo4j', {})['environment'] = normalized
+            self.logger.info("Using Neo4j environment '%s'", normalized)
+            return normalized
+
+        self.logger.info("Neo4j environment not specified; default resolution will apply")
+        return None
+
     def _setup_logging(self) -> logging.Logger:
         """Setup logging configuration."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -550,7 +574,11 @@ def main(args):
     
     try:
         # Initialize the step
-        step = Neo4jPreparationStep(args.config, args.incremental)
+        step = Neo4jPreparationStep(
+            args.config,
+            incremental=args.incremental,
+            neo4j_environment=args.neo4j_environment,
+        )
         
         # Copy input data from Step 1 outputs if provided
         input_paths = {
@@ -579,6 +607,8 @@ def main(args):
         print("=" * 60)
         print(f"Configuration: {args.config}")
         print(f"Incremental: {args.incremental}")
+        if args.neo4j_environment:
+            print(f"Neo4j environment override: {args.neo4j_environment}")
         print(f"Results:")
         
         for processor, result in results.items():
@@ -637,6 +667,12 @@ def parse_args():
         default=False,
         type=_bool_arg,
         help='Run in incremental mode (accepts true/false)'
+    )
+
+    parser.add_argument(
+        '--neo4j_environment',
+        type=str,
+        help='Override Neo4j environment (dev|test|prod)'
     )
     
     # Input paths from Step 1

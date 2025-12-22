@@ -49,7 +49,13 @@ from step_input_sync import stage_step1_outputs
 class SessionEmbeddingStep:
     """Azure ML Session Embedding Step for Personal Agendas pipeline."""
     
-    def __init__(self, config_path: str, incremental: bool = False, use_keyvault: bool = True):
+    def __init__(
+        self,
+        config_path: str,
+        incremental: bool = False,
+        use_keyvault: bool = True,
+        neo4j_environment: Optional[str] = None,
+    ):
         """
         Initialize the Session Embedding Step.
         
@@ -61,9 +67,11 @@ class SessionEmbeddingStep:
         self.config_path = config_path
         self.incremental = incremental
         self.use_keyvault = use_keyvault
+        self.neo4j_environment_override = neo4j_environment
         self.logger = self._setup_logging()
         
         self.config = self._load_configuration(config_path)
+        self.selected_neo4j_environment = self._apply_environment_override()
         # For embedding processor, incremental means create_only_new
         self.create_only_new = self.incremental
 
@@ -98,6 +106,7 @@ class SessionEmbeddingStep:
                     existing_user,
                     existing_pwd,
                     logger=self.logger,
+                    environment_override=self.selected_neo4j_environment,
                 )
                 self.logger.info("Neo4j credentials already available in environment; skipping Key Vault")
                 return
@@ -127,6 +136,7 @@ class SessionEmbeddingStep:
                 neo4j_secrets.get("NEO4J_USERNAME"),
                 neo4j_secrets.get("NEO4J_PASSWORD"),
                 logger=self.logger,
+                environment_override=self.selected_neo4j_environment,
             )
 
             self.logger.info("Successfully loaded all secrets from Key Vault")
@@ -135,6 +145,20 @@ class SessionEmbeddingStep:
             self.logger.warning(f"Could not load secrets from Key Vault: {e}")
             self.logger.info("Will fall back to environment variables or .env file")
     
+    def _apply_environment_override(self) -> Optional[str]:
+        """Ensure the config uses the highest-priority Neo4j environment selection."""
+        config_env = (self.config.get('neo4j', {}) or {}).get('environment')
+        selected = self.neo4j_environment_override or config_env
+
+        if selected:
+            normalized = str(selected).strip()
+            self.config.setdefault('neo4j', {})['environment'] = normalized
+            self.logger.info("Using Neo4j environment '%s'", normalized)
+            return normalized
+
+        self.logger.info("Neo4j environment not specified; defaulting to config/ENV values")
+        return None
+
     def _load_configuration(self, config_path: str) -> Dict:
         """
         Load configuration from YAML file.
@@ -305,7 +329,11 @@ def main(args):
     
     try:
         # Initialize the step
-        step = SessionEmbeddingStep(args.config, args.incremental)
+        step = SessionEmbeddingStep(
+            args.config,
+            incremental=args.incremental,
+            neo4j_environment=args.neo4j_environment,
+        )
 
         input_paths = {
             'input_registration': args.input_registration,
@@ -328,6 +356,8 @@ def main(args):
         print("=" * 60)
         print(f"Configuration: {args.config}")
         print(f"Incremental: {args.incremental}")
+        if args.neo4j_environment:
+            print(f"Neo4j environment override: {args.neo4j_environment}")
         print(f"Results:")
         
         # Print summary
@@ -386,6 +416,12 @@ def parse_args():
         default=False,
         type=_bool_arg,
         help="Run incremental processing (accepts true/false)"
+    )
+
+    parser.add_argument(
+        "--neo4j_environment",
+        type=str,
+        help="Override Neo4j environment (dev|test|prod)"
     )
     
     parser.add_argument(
