@@ -4,6 +4,23 @@ from typing import Any, Dict, Optional, Tuple
 from dotenv import load_dotenv
 
 from PA.utils.neo4j_utils import determine_environment_key
+def select_neo4j_environment(
+    override_value: Optional[str],
+    config_value: Optional[str],
+    logger: Optional[Any] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Determine which Neo4j environment to use based on override precedence."""
+
+    for candidate in (override_value, config_value):
+        if not candidate:
+            continue
+        env_lower, env_key = determine_environment_key(
+            candidate, logger=logger, default_to_prod=False
+        )
+        if env_key:
+            return env_lower, env_key
+
+    return None, None
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_MODULE_DIR)
@@ -59,15 +76,31 @@ def apply_neo4j_credentials(
     config = config or {}
     neo4j_config = config.get("neo4j", {}) or {}
 
-    requested_environment = environment_override or neo4j_config.get("environment")
-    env_lower, env_key = determine_environment_key(requested_environment, logger=logger)
-    neo4j_config["environment"] = env_lower
+    override_clean = (environment_override or "").strip() or None
+    env_lower, env_key = select_neo4j_environment(
+        override_clean, neo4j_config.get("environment"), logger=logger
+    )
+
+    if env_lower:
+        neo4j_config["environment"] = env_lower
+    else:
+        neo4j_config.pop("environment", None)
+
     config["neo4j"] = neo4j_config
 
-    env_specific_uri = os.environ.get(f"NEO4J_URI_{env_key}")
-    env_specific_password = os.environ.get(f"NEO4J_PASSWORD_{env_key}")
+    env_specific_uri = (
+        os.environ.get(f"NEO4J_URI_{env_key}") if env_key else None
+    )
+    env_specific_password = (
+        os.environ.get(f"NEO4J_PASSWORD_{env_key}") if env_key else None
+    )
 
-    resolved_uri = (uri or env_specific_uri or neo4j_config.get("uri") or os.environ.get("NEO4J_URI"))
+    resolved_uri = (
+        uri
+        or env_specific_uri
+        or neo4j_config.get("uri")
+        or os.environ.get("NEO4J_URI")
+    )
     resolved_username = (
         username
         or neo4j_config.get("username")
@@ -93,12 +126,14 @@ def apply_neo4j_credentials(
 
     updates: Dict[str, Optional[str]] = {
         "NEO4J_URI": clean_uri,
-        f"NEO4J_URI_{env_key}": clean_uri,
         "NEO4J_USERNAME": clean_username,
         "NEO4J_PASSWORD": clean_password,
-        f"NEO4J_PASSWORD_{env_key}": clean_password,
-        "NEO4J_ENVIRONMENT_RESOLVED": env_lower,
+        "NEO4J_ENVIRONMENT_RESOLVED": env_lower or "unspecified",
     }
+
+    if env_key:
+        updates[f"NEO4J_URI_{env_key}"] = clean_uri
+        updates[f"NEO4J_PASSWORD_{env_key}"] = clean_password
 
     for key, value in updates.items():
         if value is not None:

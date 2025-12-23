@@ -109,7 +109,7 @@ steps:
   recommendations:
     enabled: true
     script: "azureml_step4_recommendations.py"
-    compute: "cpu-cluster"
+    compute: "cpu-cluster-3"
     environment: "pa-env"
     depends_on:
       - "session_embeddings"

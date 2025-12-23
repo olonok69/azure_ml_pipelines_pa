@@ -45,7 +45,7 @@ from PA.utils.config_utils import load_config
 from PA.utils.logging_utils import setup_logging
 from PA.utils.keyvault_utils import ensure_env_file, KeyVaultManager
 from PA.utils.app_insights import configure_app_insights
-from neo4j_env_utils import apply_neo4j_credentials
+from neo4j_env_utils import apply_neo4j_credentials, select_neo4j_environment
 from step_input_sync import stage_step1_outputs
 
 
@@ -70,7 +70,8 @@ class Neo4jPreparationStep:
         self.config_path = config_path
         self.incremental = incremental
         self.use_keyvault = use_keyvault
-        self.neo4j_environment_override = neo4j_environment
+        cleaned_override = (neo4j_environment or "").strip()
+        self.neo4j_environment_override = cleaned_override or None
         self.logger = self._setup_logging()
         
         self.config = self._load_configuration(config_path)
@@ -150,15 +151,23 @@ class Neo4jPreparationStep:
     def _apply_environment_override(self) -> Optional[str]:
         """Ensure the config reflects the highest-precedence Neo4j environment."""
         config_env = (self.config.get('neo4j', {}) or {}).get('environment')
-        selected = self.neo4j_environment_override or config_env
+        env_lower, _ = select_neo4j_environment(
+            self.neo4j_environment_override, config_env, logger=self.logger
+        )
 
-        if selected:
-            normalized = str(selected).strip()
-            self.config.setdefault('neo4j', {})['environment'] = normalized
-            self.logger.info("Using Neo4j environment '%s'", normalized)
-            return normalized
+        if env_lower:
+            self.config.setdefault('neo4j', {})['environment'] = env_lower
+            self.logger.info("Using Neo4j environment '%s'", env_lower)
+            return env_lower
 
-        self.logger.info("Neo4j environment not specified; default resolution will apply")
+        if self.neo4j_environment_override:
+            self.logger.warning(
+                "Ignoring invalid Neo4j environment override '%s'", 
+                self.neo4j_environment_override,
+            )
+
+        self.config.setdefault('neo4j', {}).pop('environment', None)
+        self.logger.info("Neo4j environment not specified; falling back to default credentials")
         return None
 
     def _setup_logging(self) -> logging.Logger:
@@ -607,8 +616,8 @@ def main(args):
         print("=" * 60)
         print(f"Configuration: {args.config}")
         print(f"Incremental: {args.incremental}")
-        if args.neo4j_environment:
-            print(f"Neo4j environment override: {args.neo4j_environment}")
+        resolved_env = step.selected_neo4j_environment or "default"
+        print(f"Neo4j environment (effective): {resolved_env}")
         print(f"Results:")
         
         for processor, result in results.items():

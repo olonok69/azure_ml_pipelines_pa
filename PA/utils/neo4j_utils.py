@@ -21,20 +21,29 @@ _ENVIRONMENT_KEY_MAP = {
 
 
 def determine_environment_key(
-    env_value: Optional[str], logger: Optional[logging.Logger] = None
+    env_value: Optional[str],
+    logger: Optional[logging.Logger] = None,
+    default_to_prod: bool = True,
 ) -> Tuple[str, str]:
     """Return normalized environment name and suffix key used for env vars."""
 
-    requested_env = str(env_value or "prod").strip()
+    requested_env = str(env_value or "").strip()
+    if not requested_env:
+        if not default_to_prod:
+            return "", ""
+        requested_env = "prod"
+
     requested_env_lower = requested_env.lower()
     resolved_key = _ENVIRONMENT_KEY_MAP.get(requested_env_lower)
 
     if not resolved_key:
-        if logger:
+        if logger and requested_env:
             logger.warning(
                 "Unknown Neo4j environment '%s'; defaulting to 'prod' settings",
                 requested_env,
             )
+        if not default_to_prod:
+            return "", ""
         requested_env_lower = "prod"
         resolved_key = "PROD"
 
@@ -50,17 +59,23 @@ def resolve_neo4j_credentials(
     config = config or {}
     neo4j_section = config.get("neo4j", {}) or {}
     requested_env_lower, resolved_key = determine_environment_key(
-        neo4j_section.get("environment"), logger=logger
+        neo4j_section.get("environment"), logger=logger, default_to_prod=False
     )
 
-    uri = os.getenv(f"NEO4J_URI_{resolved_key}")
-    password = os.getenv(f"NEO4J_PASSWORD_{resolved_key}")
+    env_specific_uri = (
+        os.getenv(f"NEO4J_URI_{resolved_key}") if resolved_key else None
+    )
+    env_specific_password = (
+        os.getenv(f"NEO4J_PASSWORD_{resolved_key}") if resolved_key else None
+    )
 
     # Fall back to config overrides or legacy env variables when specific ones are absent
-    if not uri:
-        uri = neo4j_section.get("uri") or os.getenv("NEO4J_URI")
-    if not password:
-        password = neo4j_section.get("password") or os.getenv("NEO4J_PASSWORD")
+    uri = env_specific_uri or neo4j_section.get("uri") or os.getenv("NEO4J_URI")
+    password = (
+        env_specific_password
+        or neo4j_section.get("password")
+        or os.getenv("NEO4J_PASSWORD")
+    )
 
     username = (
         neo4j_section.get("username")
@@ -79,8 +94,8 @@ def resolve_neo4j_credentials(
         "uri": uri,
         "username": username,
         "password": password,
-        "environment": requested_env_lower,
-        "resolved_key": resolved_key,
+        "environment": requested_env_lower or "unspecified",
+        "resolved_key": resolved_key or "",
     }
 
 
