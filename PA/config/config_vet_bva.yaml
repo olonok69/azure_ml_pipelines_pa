@@ -1,5 +1,6 @@
 # Event-specific configuration for BVA events
 # This configuration file contains all event-specific settings and output file names
+mode: "personal_agendas"  # can be engagement or personal_agendas
 
 # Event configuration 
 event:
@@ -36,6 +37,7 @@ practice_matching:
   company_column: "Company Name"
   practice_type_column: "Main Type of Veterinary Practice"
   match_threshold: 95
+  missing_companies_output: "missing_practice_companies_bva2025.csv"
 
 # Job role processing configuration
 job_role_question: "What is your job role"
@@ -149,7 +151,26 @@ session_files:
   session_past_lva: "data/bva/LVA24_session_export.csv"
 
 stream_processing:
-  use_cached_descriptions: true
+  use_cached_descriptions: false
+  create_missing_streams: true
+  use_enhanced_streams_catalog: true 
+
+# Scan output files
+scan_output_files:
+  processed_scans:
+    last_year_main: "scan_bva_past.csv"
+    last_year_secondary: "scan_lva_past.csv"
+    this_year_post: "scan_this_post.csv"
+  sessions_visited:
+    main_event: "sessions_visited_last_bva.csv"
+    secondary_event: "sessions_visited_last_lva.csv"
+    this_year_post: "sessions_visited_this_year.csv"
+  # Added explicit filenames used by attended_session relationship creation logic (currently hard-coded in processor)
+  attended_session_inputs:
+    past_year_main_scan: "scan_bva_past.csv"            # Raw past-year main scan file actually consumed when building attended_session
+    past_year_secondary_scan: "scan_lva_past.csv"       # Raw past-year secondary scan file actually consumed
+    past_year_main_filter: "df_reg_demo_last_bva.csv"    # Registration+demo filter file for main past year visitors
+    past_year_secondary_filter: "df_reg_demo_last_lva.csv" # Registration+demo filter file for secondary past year visitors
 # Session processing configuration
 # BVA-specific titles to remove during session filtering
 titles_to_remove:
@@ -192,6 +213,14 @@ map_vets:
   "iM3": "iM3 The Global Name in Veterinary Dentistry"
   "Omni": "Omni Pet Limited"
   "WVS" : "Worldwide Veterinary Service"
+  "BVCIS": "British Veterinary Chronic Illness Support"
+  "Covet": "Copolit for Veterinary"
+  "IVAPM": "International Veterinary Academy of Pain Management"
+  "KRKA": "KRKA Pharmaceutical"
+  "VESH": "VETERINARY EMERGENCY AND SPECIALTY HOSPITAL LONDON"
+  "MWI": "MWI Animal Health"
+  "AITEM": "Artificial Intelligence Technologies Multipurpose"
+  "Vedis": "Vedis Laboratories"
 
 # Embedding configuration
 embeddings:
@@ -207,21 +236,42 @@ recommendation:
   similar_visitors_count: 3       # Number of similar visitors to consider for new visitors
   resolve_overlapping_sessions_by_similarity: true 
   control_group:                  # Control-group defaults (only active in personal_agendas mode)
-    enabled: false
+    enabled: true
     percentage: 5                 # Expressed as percent (5 => 5%)
     random_seed: 42
     file_suffix: "_control"
     output_directory: "recommendations/control"
     neo4j_property: "control_group"
+  
+  returning_without_history:
+    enabled: true                # Adjust similarity scores for returning visitors with no past attendance
+    similarity_exponent: 1.5     # Exponent applied to similarity values when triggered
   use_langchain: false            # Whether to use LangChain for filtering (requires LangChain)
   enable_filtering: true          # Enable/disable filtering rules (true for vet shows)
+  theatre_capacity_limits:
+    enabled: false
+    capacity_file: ""
+    session_file: ""
+    capacity_multiplier: 1.0
+  # Additional visitor fields to include directly in exported recommendations CSV (enrichment)
+  export_additional_visitor_fields:
+    - Email
+    - Forename
+    - Surname
+    - Tel
+    - Mobile
+    - Company
+    - JobTitle
+    - Email_domain
+    - Country
+    - Source
   
   # Similarity attributes for finding similar visitors (vet-specific)
   similarity_attributes:
-    job_role: 1.0                                         # Weight for job role matching
-    what_type_does_your_practice_specialise_in: 1.0      # Weight for practice type
-    organisation_type: 1.0                               # Weight for organization type
-    Country: 1.0                                          # Weight for country
+    job_role: 0.8                                         # Weight for job role matching
+    what_type_does_your_practice_specialise_in: 0.8      # Weight for practice type
+    organisation_type: 0.8                               # Weight for organization type
+    Country: 0.5                                          # Weight for country
 
   role_groups:
     vet_roles:
@@ -255,6 +305,22 @@ recommendation:
     vet_exclusions: ["nursing"]
     nurse_streams: ["nursing", "wellbeing", "welfare"]
     rule_priority: ["practice_type", "role"]  # Order of rule application
+    custom_rules:
+      enabled: true
+      apply_to_events: ["bva", "lva"]
+      rules:
+        - name: "vet_equine_session_requires_equine_keywords"
+          enabled: true
+          params:
+            stream_keywords: ["equine"]
+            visitor_fields: ["Company", "JobTitle"]
+            required_keywords: ["horse", "equine", "mixed"]
+        - name: "vet_equine_visitors_block_feline_sessions"
+          enabled: true
+          params:
+            visitor_fields: ["Company", "JobTitle"]
+            visitor_keywords: ["equine", "horse"]
+            blocked_session_title_keywords: ["cat", "dog", "feline"]
 
 # Neo4j configuration
 neo4j:
