@@ -1,7 +1,7 @@
 # Event-specific configuration for CPCN runs
 # This configuration file contains all event-specific settings and output file names
 
-mode: "post_analysis"  # can be engagement or personal_agendas or post_analysis
+mode: "personal_agendas"  # can be engagement or personal_agendas or post_analysis
 # Documentation assets surfaced by the application
 documentation:
   generic_pipeline_map: "docs/generic_pipeline_map.svg"
@@ -123,7 +123,7 @@ output_files:
 
 
 # Pipeline control settings
-create_only_new: true  # If true, only process new visitors without recommendations
+create_only_new: false  # If true, only process new visitors without recommendations true for post_analysis
 
 # Pipeline step activation settings
 pipeline_steps:
@@ -134,11 +134,11 @@ pipeline_steps:
   # Neo4j processing steps
   neo4j_visitor_processing: true
   neo4j_session_processing: true
-  neo4j_job_stream_processing: true
-  neo4j_specialization_stream_processing: true
+  neo4j_job_stream_processing: false
+  neo4j_specialization_stream_processing: false
   neo4j_visitor_relationship_processing: true
   session_embedding_processing: true
-  session_recommendation_processing: false
+  session_recommendation_processing: true
 
 # Input file paths
 old_format: false  # Set to true if using old CSV format for registration and demographic data
@@ -227,7 +227,7 @@ recommendation:
   similar_visitors_count: 3       # Number of similar visitors to consider for new visitors
   resolve_overlapping_sessions_by_similarity: true 
   control_group:                  # Control-group defaults (only active in personal_agendas mode)
-    enabled: false
+    enabled: true
     percentage: 5                 # Expressed as percent (5 => 5%)
     random_seed: 42
     file_suffix: "_control"
@@ -235,8 +235,8 @@ recommendation:
     neo4j_property: "control_group"
     
   returning_without_history:
-    enabled: false                # Set to true if you want to boost returning visitors without scans
-    similarity_exponent: 1.0      # Only applied when enabled
+    enabled: true                # Set to true if you want to boost returning visitors without scans
+    similarity_exponent: 1.5     # Only applied when enabled
 
   use_langchain: false            # Whether to use LangChain for filtering (requires LangChain)
   enable_filtering: false          # Enable/disable filtering rules (true for vet shows)
@@ -279,7 +279,7 @@ recommendation:
 
 # Neo4j configuration for CPCN event
 neo4j:
-  environment: "test"
+  environment: "dev"
   show_name: "cpcn"  
   node_labels:
     visitor_this_year: "Visitor_this_year"
