@@ -126,9 +126,9 @@ pipeline_steps:
 # Input file paths - CHANGED FOR ECOMM
 old_format: true
 input_files:
-  main_event_registration: "data/ecomm/20250922_registration_ECE_TFM_24_25.json"  # CHANGED
+  main_event_registration: "data/ecomm/20250923_registration_ECE_TFM_24_25.json"  # CHANGED
   secondary_event_registration: "data/ecomm/20250722_registration_TFM24.json"  # CHANGED
-  main_event_demographic: "data/ecomm/20250922_demographics_ECE_TFM_24_25.json"  # CHANGED
+  main_event_demographic: "data/ecomm/20250923_demographics_ECE_TFM_24_25.json"  # CHANGED
   secondary_event_demographic: "data/ecomm/20250722_demographics_TFM24.json"  # CHANGED
   # practices: "data/ecomm/practices_missing.csv"  # CHANGED
 
