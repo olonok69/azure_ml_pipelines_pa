@@ -120,6 +120,7 @@ class RecommendationsStep:
         self.config = self._load_configuration(config_path)
         self.selected_neo4j_environment = self._apply_environment_override()
         self.create_only_new = self.incremental
+        self.config_snapshot_path: Optional[Path] = None
 
         if any([self.session_data_path, self.registration_data_path, self.scan_data_path]):
             self._remap_session_support_files()
@@ -617,6 +618,40 @@ class RecommendationsStep:
             self.logger.error(f"Error in recommendation processing: {e}")
             self.logger.debug(traceback.format_exc())
             return {'status': 'failed', 'error': str(e), 'statistics': {}}
+
+    def _snapshot_config_file(self, output_dir: str, results: Dict[str, Any]) -> None:
+        """Copy the config YAML alongside recommendation outputs for auditing."""
+        try:
+            config_src = Path(self.config_path)
+            if not config_src.exists():
+                self.logger.warning("Config file %s not found; skipping snapshot", config_src)
+                return
+
+            rec_section = results.setdefault('recommendations', {})
+            output_files = rec_section.setdefault('output_files', {})
+            show_name = self.config.get('event', {}).get('name', 'ecomm')
+            timestamp_label = None
+
+            json_path = output_files.get('json')
+            if json_path:
+                prefix = f"visitor_recommendations_{show_name}_"
+                stem = Path(json_path).stem
+                if stem.startswith(prefix):
+                    timestamp_label = stem[len(prefix):]
+
+            suffix = config_src.suffix or '.yaml'
+            if timestamp_label:
+                dest_name = f"config_snapshot_{timestamp_label}{suffix}"
+            else:
+                dest_name = f"config_snapshot{suffix}"
+
+            dest_path = Path(output_dir) / dest_name
+            shutil.copy2(config_src, dest_path)
+            output_files['config_snapshot'] = str(dest_path)
+            self.config_snapshot_path = dest_path
+            self.logger.info("Stored config snapshot alongside recommendations: %s", dest_path)
+        except Exception as exc:
+            self.logger.error("Failed to snapshot config file: %s", exc)
     
     def save_outputs(self, results: Dict[str, Any], output_dir: str):
         """
@@ -641,6 +676,7 @@ class RecommendationsStep:
                         dest_path = os.path.join(output_dir, os.path.basename(file_path))
                         shutil.copy2(file_path, dest_path)
                         self.logger.info(f"Copied {file_type} recommendations to: {dest_path}")
+                self._snapshot_config_file(output_dir, results)
             
             # Save results summary
             summary_path = os.path.join(output_dir, 'recommendations_summary.json')
@@ -762,18 +798,34 @@ class RecommendationsStep:
                     except Exception as e:
                         raise Exception(f"Could not find any accessible container: {e}")
                 
-                # Find recommendation files to upload
-                files_to_upload = []
-                for file in os.listdir(output_dir):
-                    if file.startswith('visitor_recommendations_') and file.endswith(('.json', '.csv', '.parquet')):
-                        files_to_upload.append(file)
-                
-                if not files_to_upload:
+                output_path = Path(output_dir)
+                recommendation_files = [
+                    file for file in os.listdir(output_dir)
+                    if file.startswith('visitor_recommendations_') and file.endswith(('.json', '.csv', '.parquet'))
+                ]
+
+                if not recommendation_files:
                     self.logger.warning("No recommendation files found to upload")
                     return
                 
-                # Extract timestamp from filename
-                timestamp_part = files_to_upload[0].replace('visitor_recommendations_', '').replace(f'{event_name}_', '').split('.')[0]
+                config_snapshot_name = None
+                if self.config_snapshot_path and self.config_snapshot_path.exists():
+                    if Path(self.config_snapshot_path).parent == output_path:
+                        config_snapshot_name = Path(self.config_snapshot_path).name
+                    else:
+                        self.logger.debug(
+                            "Config snapshot %s not located in %s; skipping upload",
+                            self.config_snapshot_path,
+                            output_dir,
+                        )
+
+                files_to_upload = recommendation_files.copy()
+                if config_snapshot_name:
+                    files_to_upload.append(config_snapshot_name)
+
+                # Extract timestamp from a recommendation filename for folder naming
+                primary_example = recommendation_files[0]
+                timestamp_part = primary_example.replace('visitor_recommendations_', '').replace(f'{event_name}_', '').split('.')[0]
                 
                 # Create the blob path
                 blob_folder = f"data/{event_name}/recommendations/visitor_recommendations_{event_name}_{timestamp_part}"
