@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1100" height="620" viewBox="0 0 1100 620" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .title { font: 22px sans-serif; font-weight: bold; fill: #1b1f3b; }
+    .label { font: 14px sans-serif; fill: #1b1f3b; }
+    .step { fill: #f4f7fb; stroke: #305c8a; stroke-width: 2; rx: 14; }
+    .io { fill: #fff4e6; stroke: #c46c15; stroke-width: 1.5; rx: 12; }
+    .meta { fill: #e7f5ff; stroke: #1f7fbf; stroke-width: 1.5; rx: 14; }
+    .arrow { stroke: #305c8a; stroke-width: 2; marker-end: url(#arrowhead); }
+    .note { font: 12px sans-serif; fill: #28415c; }
+  </style>
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#305c8a" />
+    </marker>
+  </defs>
+
+  <text x="550" y="50" text-anchor="middle" class="title">Azure ML Pipeline – Personal Agendas</text>
+
+  <!-- Outputs per step (top) -->
+  <rect x="90" y="80" width="170" height="110" class="meta" />
+  <text x="175" y="120" text-anchor="middle" class="label">Outputs</text>
+  <text x="175" y="145" text-anchor="middle" class="note">registration / scan / session</text>
+  <line x1="175" y1="230" x2="175" y2="190" class="arrow" />
+
+  <rect x="350" y="80" width="170" height="110" class="meta" />
+  <text x="435" y="120" text-anchor="middle" class="label">Outputs</text>
+  <text x="435" y="145" text-anchor="middle" class="note">Neo4j stats + metadata</text>
+  <line x1="435" y1="230" x2="435" y2="190" class="arrow" />
+
+  <rect x="610" y="80" width="170" height="110" class="meta" />
+  <text x="695" y="120" text-anchor="middle" class="label">Outputs</text>
+  <text x="695" y="145" text-anchor="middle" class="note">Embedding summary</text>
+  <line x1="695" y1="230" x2="695" y2="190" class="arrow" />
+
+  <rect x="855" y="80" width="200" height="110" class="meta" />
+  <text x="955" y="120" text-anchor="middle" class="label">Outputs</text>
+  <text x="955" y="145" text-anchor="middle" class="note">Rec CSV + JSON + logs</text>
+  <line x1="955" y1="230" x2="955" y2="190" class="arrow" />
+
+  <!-- Step boxes -->
+  <rect x="70" y="230" width="210" height="150" class="step" />
+  <rect x="330" y="230" width="210" height="150" class="step" />
+  <rect x="590" y="230" width="210" height="150" class="step" />
+  <rect x="850" y="230" width="210" height="150" class="step" />
+
+  <!-- Step titles -->
+  <text x="175" y="265" text-anchor="middle" class="label">Step 1</text>
+  <text x="175" y="285" text-anchor="middle" class="label">Data Preparation</text>
+
+  <text x="435" y="265" text-anchor="middle" class="label">Step 2</text>
+  <text x="435" y="285" text-anchor="middle" class="label">Neo4j Preparation</text>
+
+  <text x="695" y="265" text-anchor="middle" class="label">Step 3</text>
+  <text x="695" y="285" text-anchor="middle" class="label">Session Embeddings</text>
+
+  <text x="955" y="265" text-anchor="middle" class="label">Step 4</text>
+  <text x="955" y="285" text-anchor="middle" class="label">Recommendations</text>
+
+  <!-- Step descriptions -->
+  <text x="175" y="325" text-anchor="middle" class="note">Registration / Scan / Session</text>
+  <text x="175" y="345" text-anchor="middle" class="note">processors + landing copy</text>
+
+  <text x="435" y="325" text-anchor="middle" class="note">Visitor / Session graph load</text>
+  <text x="435" y="345" text-anchor="middle" class="note">Job &amp; specialization mappings</text>
+
+  <text x="695" y="325" text-anchor="middle" class="note">Generate embeddings</text>
+  <text x="695" y="345" text-anchor="middle" class="note">Store stats + completion</text>
+
+  <text x="955" y="325" text-anchor="middle" class="note">Similarity + scoring</text>
+  <text x="955" y="345" text-anchor="middle" class="note">Export CSV / JSON</text>
+
+  <!-- Horizontal arrows between steps -->
+  <line x1="280" y1="320" x2="330" y2="320" class="arrow" />
+  <text x="305" y="310" text-anchor="middle" class="note">registration/scan/session folders</text>
+
+  <line x1="540" y1="320" x2="590" y2="320" class="arrow" />
+  <text x="565" y="310" text-anchor="middle" class="note">metadata + Neo4j state</text>
+
+  <line x1="800" y1="320" x2="850" y2="320" class="arrow" />
+  <text x="825" y="310" text-anchor="middle" class="note">embedding stats</text>
+
+  <!-- Inputs -->
+  <rect x="40" y="430" width="190" height="80" class="io" />
+  <text x="135" y="460" text-anchor="middle" class="label">Inputs</text>
+  <text x="135" y="480" text-anchor="middle" class="note">Landing datastore</text>
+  <text x="135" y="500" text-anchor="middle" class="note">Config + secrets</text>
+  <line x1="135" y1="430" x2="175" y2="380" class="arrow" />
+
+  <!-- Landing outputs -->
+  <rect x="870" y="430" width="210" height="90" class="io" />
+  <text x="975" y="460" text-anchor="middle" class="label">Final Artifacts</text>
+  <text x="975" y="480" text-anchor="middle" class="note">Datastore copy of outputs</text>
+  <text x="975" y="500" text-anchor="middle" class="note">Neo4j recommendation flags</text>
+  <line x1="955" y1="380" x2="980" y2="430" class="arrow" />
+
+  <!-- Legend -->
+  <rect x="60" y="520" width="980" height="70" fill="#f7f7f7" stroke="#c3c6d1" rx="12" />
+  <text x="100" y="555" class="note">Legend:</text>
+  <circle cx="170" cy="550" r="8" fill="#f4f7fb" stroke="#305c8a" stroke-width="2" />
+  <text x="185" y="555" class="note">Azure ML Step (runs PA processor)</text>
+  <circle cx="390" cy="550" r="8" fill="#fff4e6" stroke="#c46c15" stroke-width="1.5" />
+  <text x="405" y="555" class="note">Inputs/outputs mounted from datastore</text>
+  <circle cx="700" cy="550" r="8" fill="#e7f5ff" stroke="#1f7fbf" stroke-width="1.5" />
+  <text x="715" y="555" class="note">Metadata persisted for downstream steps</text>
+</svg>
